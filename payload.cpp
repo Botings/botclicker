@@ -42,6 +42,7 @@ static bool          g_canDetectBlocks = false;
 
 static volatile HWND g_gameWindow = nullptr;
 static volatile bool g_physDown    = false;   // real (non-injected) LMB state
+static volatile bool g_enabled     = false;   // armed via J toggle; starts off
 static HHOOK         g_mouseHook   = nullptr;
 static HANDLE        g_hookThread  = nullptr;
 static DWORD         g_hookThreadId = 0;
@@ -81,7 +82,8 @@ static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
     if (code == HC_ACTION) {
         auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
         bool injected = (m->flags & LLMHF_INJECTED) != 0;   // our own SendInput clicks
-        if (!injected && gameFocused()) {
+        // Only seize the left button while armed; otherwise real clicks pass through normally.
+        if (!injected && g_enabled && gameFocused()) {
             if (w == WM_LBUTTONDOWN) { g_physDown = true;  return 1; }  // swallow real press
             if (w == WM_LBUTTONUP)   { g_physDown = false; return 1; }  // swallow real release
         }
@@ -185,6 +187,16 @@ static bool setupJvm(JNIEnv* env) {
     return true;
 }
 
+// Is a GUI/screen (inventory, chat, menu...) currently open? Used to ignore the J toggle
+// while the player is typing, so 'j' in chat doesn't flip the clicker.
+static bool screenOpen(JNIEnv* env) {
+    if (!g_canDetectBlocks || !g_fCurrentScreen || !g_mcInstance) return false;
+    jobject scr = env->GetObjectField(g_mcInstance, g_fCurrentScreen);
+    bool open = (scr != nullptr);
+    if (scr) env->DeleteLocalRef(scr);
+    return open;
+}
+
 // Returns true if a synthetic click is allowed right now.
 static bool shouldClick(JNIEnv* env) {
     if (!g_canDetectBlocks) return true;  // degraded mode
@@ -245,20 +257,31 @@ static void run() {
         setupJvm(env);
     }
 
-    logf("[ac] running at %.1f CPS. Hold LEFT-CLICK in-game to autoclick. Press END to unload.\n\n", CPS);
+    logf("[ac] running at %.1f CPS. Press J to toggle (starts OFF). Hold LEFT-CLICK while armed. Press END to unload.\n\n", CPS);
 
     g_hookThread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
 
     int  lastState = -99;   // 0 idle, 1 clicking, 2 holding-on-block, 3 degraded-click
     double acc = 0.0;
+    bool lastJ = false;
 
     while (g_running) {
         if (GetAsyncKeyState(VK_END) & 0x8000) { logf("[ac] END pressed -- unloading.\n"); break; }
 
         g_gameWindow = findGameWindow();
 
+        // J toggle: edge-detected, only when focused and not typing in a screen/chat.
+        bool jDown = (GetAsyncKeyState('J') & 0x8000) != 0;
+        if (jDown && !lastJ && gameFocused() && !(env && screenOpen(env))) {
+            g_enabled = !g_enabled;
+            if (!g_enabled) g_physDown = false;          // drop any held state when disarming
+            logf("[ac] %s\n", g_enabled ? "ENABLED (J)" : "DISABLED (J)");
+            lastState = -99;                              // force activity line to reprint
+        }
+        lastJ = jDown;
+
         int state = 0;
-        if (g_physDown && gameFocused()) {
+        if (g_enabled && g_physDown && gameFocused()) {
             bool ok = env ? shouldClick(env) : true;
             if (ok) { sendClick(); state = g_canDetectBlocks ? 1 : 3; }
             else    { state = 2; }  // aimed at a block -> deliberately doing nothing
@@ -266,11 +289,11 @@ static void run() {
             g_physDown = false;     // avoid a stuck "down" if focus was lost mid-hold
         }
 
-        if (state != lastState) {
+        if (g_enabled && state != lastState) {
             if      (state == 1) logf("[ac] autoclicking (entity/air)\n");
             else if (state == 2) logf("[ac] aimed at block -> NOT clicking\n");
             else if (state == 3) logf("[ac] autoclicking (no block-detect)\n");
-            else                 logf("[ac] idle\n");
+            else                 logf("[ac] armed, idle\n");
             lastState = state;
         }
 
