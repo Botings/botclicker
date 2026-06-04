@@ -3,12 +3,28 @@
 A minimal Windows DLL injector and a demo payload, targeting Minecraft Java (`javaw.exe`).
 
 - **`injector.cpp`** — classic `LoadLibrary` injector via `CreateRemoteThread`.
-- **`payload.cpp`** — injected DLL that reports whether a GUI/inventory screen is open,
-  using the cursor-grab heuristic (Minecraft releases the OS cursor whenever a screen opens).
+- **`payload.cpp`** — a JVMTI/JNI agent: a left-click autoclicker that **never mines blocks**.
+
+## What the agent does
+
+While Minecraft is the foreground window, holding **left-click** fires clicks at **15.8 CPS**:
+
+- A low-level mouse hook **swallows your real left-click** and the agent synthesizes all
+  clicks itself — this is what lets it avoid mining a block you're holding LMB on.
+- It reads `Minecraft.objectMouseOver.typeOfHit` over JVMTI/JNI:
+  - aimed at a **block** → injects nothing (block untouched),
+  - **air / entity** → clicks through (attack swings),
+  - a **GUI is open** (`currentScreen != null`, e.g. your inventory) → clicks through.
+- Field names are tried as MCP (dev) then SRG (prod), so the same DLL works in a Gradle
+  `runClient` session and a shipped Forge client. If neither resolves it degrades to
+  "always click" and prints a warning.
+
+Press **END** to unload cleanly.
 
 ## Build
 
-Requires MinGW-w64 g++ (64-bit, to match modern Minecraft's bundled Java).
+Requires MinGW-w64 g++ (64-bit) and a JDK with JNI/JVMTI headers. Defaults to
+`C:/Program Files/Java/jdk1.8.0_201`; override with `$env:JDK_HOME`.
 
 ```powershell
 .\build.ps1
@@ -16,13 +32,15 @@ Requires MinGW-w64 g++ (64-bit, to match modern Minecraft's bundled Java).
 
 ## Run
 
-1. Launch Minecraft Java and enter a world.
+1. Launch Minecraft Java (1.8.9 Forge) and enter a world.
 2. `.\injector.exe`  (run the terminal as administrator if `OpenProcess` fails).
-3. A console reports inventory/GUI state. Open your inventory (E) to see it flip.
-4. Press **END** to cleanly unload the DLL.
+3. A console shows agent state (idle / autoclicking / aimed-at-block).
+4. Press **END** to cleanly unload.
 
-## Limitation
+## Notes / assumptions
 
-The cursor heuristic detects *any* open screen (inventory, chat, pause, chests) — it can't
-single out the inventory specifically. True inventory-only detection needs a JVMTI agent or a
-Forge mod that reads `Minecraft.currentScreen`.
+- Built and verified to compile; **not yet runtime-tested against a live client**.
+- Field names target **1.8.9 `stable_22`** mappings. Other versions need their own MCP/SRG
+  names added in `payload.cpp` (`findField` calls).
+- Arch must match the JVM (64-bit here). Anti-cheats that monitor `SetWindowsHookEx` /
+  `CreateRemoteThread` may flag this.

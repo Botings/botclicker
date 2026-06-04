@@ -2,8 +2,13 @@
 $ErrorActionPreference = "Stop"
 $flags = @("-O2", "-s", "-static", "-static-libgcc", "-static-libstdc++")
 
+# JDK headers for JNI/JVMTI (payload is a JVMTI agent). Override $env:JDK_HOME if yours differs.
+$jdk = if ($env:JDK_HOME) { $env:JDK_HOME } else { "C:/Program Files/Java/jdk1.8.0_201" }
+if (-not (Test-Path "$jdk/include/jvmti.h")) { throw "JVMTI headers not found under $jdk (set `$env:JDK_HOME)" }
+$inc = @("-I$jdk/include", "-I$jdk/include/win32")
+
 Write-Host "Building payload.dll ..." -ForegroundColor Cyan
-& g++ -shared @flags -o payload.dll payload.cpp -luser32
+& g++ -shared @flags @inc -o payload.dll payload.cpp -luser32
 if ($LASTEXITCODE -ne 0) { throw "payload.dll build failed" }
 
 Write-Host "Building injector.exe ..." -ForegroundColor Cyan

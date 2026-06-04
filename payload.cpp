@@ -1,103 +1,304 @@
-// payload.cpp  --  the injected DLL. Reports whether a GUI/inventory screen is open.
+// payload.cpp  --  JVMTI/JNI agent: a left-click autoclicker that never mines blocks.
 //
-// How it detects "in inventory" WITHOUT reading JVM memory:
-//   While you're playing, Minecraft "grabs" the mouse -- it hides the OS cursor and
-//   keeps re-centering it. The moment any screen opens (inventory, chat, pause, a
-//   chest, the death screen...) the game releases the cursor so you can click the UI.
-//   So: OS cursor visible + game focused  =>  a GUI screen is open.
+// Injected via injector.exe into javaw.exe (Minecraft 1.8.9 Forge). On attach it grabs
+// the running JVM (JNI_GetCreatedJavaVMs), gets a JVMTI env, and locates a few Minecraft
+// fields so it can read what the player is looking at.
 //
-//   Limitation (by design, since this is a generic DLL): this can't tell the
-//   *inventory* apart from other screens. Distinguishing the specific screen would
-//   require reading Minecraft.currentScreen from the JVM (a JVMTI agent or a Forge mod).
+// Behaviour (only while Minecraft is the foreground window):
+//   * A low-level mouse hook SWALLOWS your real left-click and we synthesize all clicks
+//     ourselves -- this is what lets us NOT mine a block you're holding LMB on.
+//   * While you hold LMB we inject clicks at 15.8 CPS, EXCEPT when your crosshair is on a
+//     block (objectMouseOver.typeOfHit == BLOCK) -> we inject nothing, so blocks are never hit.
+//   * Air / entities -> clicks go through (attack swings).
+//   * A GUI is open (currentScreen != null, e.g. your inventory) -> clicks go through.
 //
-// Press END (game or this console focused) to unload the DLL cleanly.
+// Field names are resolved by trying MCP (dev) names first, then SRG (prod) names, so the
+// same DLL works in a Gradle runClient session and a shipped Forge client. If neither
+// resolves it degrades to "always click" and says so in the console.
+//
+// Press END to unload cleanly.
 
 #include <windows.h>
+#include <jni.h>
+#include <jvmti.h>
 #include <cstdio>
+#include <cstring>
 
-static HMODULE        g_self    = nullptr;
-static volatile bool  g_running = true;
+// ---- globals ---------------------------------------------------------------
+static HMODULE       g_self      = nullptr;
+static volatile bool g_running   = true;
 
+static JavaVM*       g_jvm       = nullptr;
+static jvmtiEnv*     g_jvmti     = nullptr;
+
+static jclass        g_mcClass    = nullptr;  // global ref: net.minecraft.client.Minecraft
+static jobject       g_mcInstance = nullptr;  // global ref: the Minecraft singleton
+static jfieldID      g_fObjMouseOver = nullptr;
+static jfieldID      g_fCurrentScreen = nullptr;
+static jclass        g_mopClass   = nullptr;  // global ref: MovingObjectPosition (lazy)
+static jfieldID      g_fTypeOfHit = nullptr;  // lazy
+static jmethodID     g_midOrdinal = nullptr;  // java.lang.Enum.ordinal()
+static bool          g_canDetectBlocks = false;
+
+static volatile HWND g_gameWindow = nullptr;
+static volatile bool g_physDown    = false;   // real (non-injected) LMB state
+static HHOOK         g_mouseHook   = nullptr;
+static HANDLE        g_hookThread  = nullptr;
+static DWORD         g_hookThreadId = 0;
+
+static const double  CPS        = 15.8;
+static const double  PERIOD_MS  = 1000.0 / CPS;  // ~63.29 ms
+
+// ---- console ---------------------------------------------------------------
+static void logf(const char* fmt, ...) {
+    va_list a; va_start(a, fmt); vprintf(fmt, a); va_end(a);
+    fflush(stdout);
+}
+
+// ---- window helpers --------------------------------------------------------
 struct FindData { DWORD pid; HWND hwnd; };
-
-// Pick the main visible top-level window owned by this (the Minecraft) process.
 static BOOL CALLBACK enumProc(HWND hwnd, LPARAM lp) {
     auto* fd = reinterpret_cast<FindData*>(lp);
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
+    DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
     if (pid == fd->pid && IsWindowVisible(hwnd) && GetWindow(hwnd, GW_OWNER) == nullptr) {
-        char title[256];
-        if (GetWindowTextA(hwnd, title, sizeof(title)) > 0) {  // skip untitled helper windows
-            fd->hwnd = hwnd;
-            return FALSE;  // found it, stop enumerating
-        }
+        char t[256];
+        if (GetWindowTextA(hwnd, t, sizeof(t)) > 0) { fd->hwnd = hwnd; return FALSE; }
     }
     return TRUE;
 }
-
 static HWND findGameWindow() {
     FindData fd{ GetCurrentProcessId(), nullptr };
     EnumWindows(enumProc, reinterpret_cast<LPARAM>(&fd));
     return fd.hwnd;
 }
-
-static bool cursorVisible() {
-    CURSORINFO ci{};
-    ci.cbSize = sizeof(ci);
-    if (!GetCursorInfo(&ci)) return false;
-    return (ci.flags & CURSOR_SHOWING) != 0;
+static inline bool gameFocused() {
+    HWND g = g_gameWindow;
+    return g && GetForegroundWindow() == g;
 }
 
-static void run() {
-    AllocConsole();
-    FILE* f = nullptr;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("MC Inventory Probe");
-
-    printf("[probe] attached to javaw (pid %lu)\n", GetCurrentProcessId());
-    printf("[probe] heuristic: OS cursor visible while game focused => a GUI/inventory screen is open.\n");
-    printf("[probe] press END to unload.\n\n");
-
-    HWND game = nullptr;
-    int  last = -99;  // force first print
-
-    while (g_running) {
-        if (GetAsyncKeyState(VK_END) & 0x8000) {
-            printf("[probe] END pressed -- unloading.\n");
-            break;
+// ---- low-level mouse hook: own the left button while MC is focused ----------
+static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
+    if (code == HC_ACTION) {
+        auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
+        bool injected = (m->flags & LLMHF_INJECTED) != 0;   // our own SendInput clicks
+        if (!injected && gameFocused()) {
+            if (w == WM_LBUTTONDOWN) { g_physDown = true;  return 1; }  // swallow real press
+            if (w == WM_LBUTTONUP)   { g_physDown = false; return 1; }  // swallow real release
         }
+    }
+    return CallNextHookEx(nullptr, code, w, l);
+}
+static DWORD WINAPI hookThread(LPVOID) {
+    g_hookThreadId = GetCurrentThreadId();
+    // hMod = our DLL (it contains mouseProc); also keeps a ref while the hook lives.
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, mouseProc, g_self, 0);
+    if (!g_mouseHook) { logf("[ac] WARNING: mouse hook failed (%lu)\n", GetLastError()); return 1; }
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) { /* pump until WM_QUIT */ }
+    UnhookWindowsHookEx(g_mouseHook);
+    g_mouseHook = nullptr;
+    return 0;
+}
 
-        if (!game || !IsWindow(game)) game = findGameWindow();
+static void sendClick() {
+    INPUT in[2] = {};
+    in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(2, in, sizeof(INPUT));
+}
 
-        int state;
-        if (game && GetForegroundWindow() == game)
-            state = cursorVisible() ? 1 : 0;   // 1 = GUI open, 0 = in-game
-        else
-            state = -1;                         // game not focused -> unknown
-
-        if (state != last) {
-            if      (state == 1)  printf("[probe] In inventory / GUI screen: YES\n");
-            else if (state == 0)  printf("[probe] In inventory / GUI screen: NO  (playing)\n");
-            else                  printf("[probe] (game window not focused -- state unknown)\n");
-            last = state;
+// ---- JVMTI field discovery (tries MCP name, then SRG name) ------------------
+static jclass findLoadedClass(JNIEnv* env, const char* sig) {
+    jint n = 0; jclass* classes = nullptr;
+    if (g_jvmti->GetLoadedClasses(&n, &classes) != JVMTI_ERROR_NONE) return nullptr;
+    jclass found = nullptr;
+    for (jint i = 0; i < n; i++) {
+        char* csig = nullptr;
+        if (g_jvmti->GetClassSignature(classes[i], &csig, nullptr) == JVMTI_ERROR_NONE && csig) {
+            if (strcmp(csig, sig) == 0) found = static_cast<jclass>(env->NewGlobalRef(classes[i]));
+            g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(csig));
         }
-        Sleep(100);
+        if (found) break;
+    }
+    g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(classes));
+    return found;
+}
+// Search fields declared on `klass`; match MCP or SRG name. Reports static-ness.
+static jfieldID findField(jclass klass, const char* mcp, const char* srg, bool* isStatic) {
+    jint n = 0; jfieldID* fs = nullptr;
+    if (g_jvmti->GetClassFields(klass, &n, &fs) != JVMTI_ERROR_NONE) return nullptr;
+    jfieldID res = nullptr;
+    for (jint i = 0; i < n; i++) {
+        char* name = nullptr; char* sig = nullptr;
+        if (g_jvmti->GetFieldName(klass, fs[i], &name, &sig, nullptr) == JVMTI_ERROR_NONE && name) {
+            if (strcmp(name, mcp) == 0 || (srg && strcmp(name, srg) == 0)) {
+                res = fs[i];
+                if (isStatic) { jint mod = 0; g_jvmti->GetFieldModifiers(klass, fs[i], &mod); *isStatic = (mod & 0x0008) != 0; }
+            }
+        }
+        if (name) g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+        if (sig)  g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(sig));
+        if (res) break;
+    }
+    g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(fs));
+    return res;
+}
+
+static bool setupJvm(JNIEnv* env) {
+    // jvm.dll is already loaded in javaw; resolve the entrypoint dynamically.
+    HMODULE jvmDll = GetModuleHandleA("jvm.dll");
+    if (!jvmDll) { logf("[ac] jvm.dll not found in process\n"); return false; }
+    typedef jint (JNICALL *GetCreatedFn)(JavaVM**, jsize, jsize*);
+    auto getCreated = reinterpret_cast<GetCreatedFn>(GetProcAddress(jvmDll, "JNI_GetCreatedJavaVMs"));
+    if (!getCreated) { logf("[ac] JNI_GetCreatedJavaVMs missing\n"); return false; }
+
+    JavaVM* vms[1]; jsize cnt = 0;
+    if (getCreated(vms, 1, &cnt) != JNI_OK || cnt < 1) { logf("[ac] no JVM found\n"); return false; }
+    g_jvm = vms[0];
+
+    if (g_jvm->GetEnv(reinterpret_cast<void**>(&g_jvmti), JVMTI_VERSION_1_2) != JNI_OK || !g_jvmti) {
+        logf("[ac] could not get JVMTI env\n"); return false;
     }
 
-    fflush(stdout);
-    if (f) fclose(f);
-    FreeConsole();
-    FreeLibraryAndExitThread(g_self, 0);  // unmap this DLL and end the thread
+    g_mcClass = findLoadedClass(env, "Lnet/minecraft/client/Minecraft;");
+    if (!g_mcClass) { logf("[ac] Minecraft class not loaded yet\n"); return false; }
+
+    bool isStatic = false;
+    jfieldID fTheMc = findField(g_mcClass, "theMinecraft", "field_71432_P", &isStatic);
+    g_fObjMouseOver  = findField(g_mcClass, "objectMouseOver", "field_71476_x", nullptr);
+    g_fCurrentScreen = findField(g_mcClass, "currentScreen",   "field_71462_r", nullptr);
+
+    if (fTheMc && isStatic) {
+        jobject mc = env->GetStaticObjectField(g_mcClass, fTheMc);
+        if (mc) { g_mcInstance = env->NewGlobalRef(mc); env->DeleteLocalRef(mc); }
+    }
+
+    jclass enumC = env->FindClass("java/lang/Enum");  // bootstrap class -> findable from native thread
+    if (enumC) { g_midOrdinal = env->GetMethodID(enumC, "ordinal", "()I"); env->DeleteLocalRef(enumC); }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    g_canDetectBlocks = (g_mcInstance && g_fObjMouseOver && g_midOrdinal);
+    logf("[ac] field resolution: theMinecraft=%s objectMouseOver=%s currentScreen=%s\n",
+         g_mcInstance ? "ok" : "MISS", g_fObjMouseOver ? "ok" : "MISS", g_fCurrentScreen ? "ok" : "MISS");
+    if (!g_canDetectBlocks)
+        logf("[ac] WARNING: block detection unavailable -> will click everywhere (incl. blocks).\n");
+    return true;
 }
 
-// Thread entry must be a plain function pointer; a non-capturing lambda qualifies.
+// Returns true if a synthetic click is allowed right now.
+static bool shouldClick(JNIEnv* env) {
+    if (!g_canDetectBlocks) return true;  // degraded mode
+
+    // A GUI (inventory, chest, ...) is open -> safe to click, no blocks involved.
+    if (g_fCurrentScreen) {
+        jobject scr = env->GetObjectField(g_mcInstance, g_fCurrentScreen);
+        bool gui = (scr != nullptr);
+        if (scr) env->DeleteLocalRef(scr);
+        if (gui) return true;
+    }
+
+    // In-world: inspect the crosshair target.
+    jobject mop = env->GetObjectField(g_mcInstance, g_fObjMouseOver);
+    if (!mop) return true;  // nothing targeted (air) -> allow attack swing
+
+    if (!g_mopClass) {  // resolve typeOfHit once, off the live object's class
+        jclass c = env->GetObjectClass(mop);
+        g_mopClass = static_cast<jclass>(env->NewGlobalRef(c));
+        env->DeleteLocalRef(c);
+        g_fTypeOfHit = findField(g_mopClass, "typeOfHit", "field_72313_a", nullptr);
+    }
+
+    bool isBlock = false;
+    if (g_fTypeOfHit) {
+        jobject t = env->GetObjectField(mop, g_fTypeOfHit);  // MovingObjectType enum
+        if (t) {
+            jint ord = env->CallIntMethod(t, g_midOrdinal);  // MISS=0, BLOCK=1, ENTITY=2
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            isBlock = (ord == 1);
+            env->DeleteLocalRef(t);
+        }
+    }
+    env->DeleteLocalRef(mop);
+    return !isBlock;  // skip only when aimed at a block
+}
+
+// ---- main agent thread -----------------------------------------------------
+static void run() {
+    AllocConsole();
+    FILE* f = nullptr; freopen_s(&f, "CONOUT$", "w", stdout);
+    SetConsoleTitleA("MC AutoClicker (no-block)");
+
+    logf("[ac] attached to pid %lu. resolving JVM...\n", GetCurrentProcessId());
+
+    JNIEnv* env = nullptr;
+    if (g_jvm == nullptr) {
+        // Bootstrap: get a JavaVM* first so we can attach this thread.
+        HMODULE jvmDll = GetModuleHandleA("jvm.dll");
+        typedef jint (JNICALL *GetCreatedFn)(JavaVM**, jsize, jsize*);
+        auto getCreated = jvmDll ? reinterpret_cast<GetCreatedFn>(GetProcAddress(jvmDll, "JNI_GetCreatedJavaVMs")) : nullptr;
+        JavaVM* vms[1]; jsize cnt = 0;
+        if (getCreated && getCreated(vms, 1, &cnt) == JNI_OK && cnt >= 1) g_jvm = vms[0];
+    }
+    if (!g_jvm || g_jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK) {
+        logf("[ac] FATAL: could not attach to JVM. Is this Minecraft Java?\n");
+    } else {
+        setupJvm(env);
+    }
+
+    logf("[ac] running at %.1f CPS. Hold LEFT-CLICK in-game to autoclick. Press END to unload.\n\n", CPS);
+
+    g_hookThread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
+
+    int  lastState = -99;   // 0 idle, 1 clicking, 2 holding-on-block, 3 degraded-click
+    double acc = 0.0;
+
+    while (g_running) {
+        if (GetAsyncKeyState(VK_END) & 0x8000) { logf("[ac] END pressed -- unloading.\n"); break; }
+
+        g_gameWindow = findGameWindow();
+
+        int state = 0;
+        if (g_physDown && gameFocused()) {
+            bool ok = env ? shouldClick(env) : true;
+            if (ok) { sendClick(); state = g_canDetectBlocks ? 1 : 3; }
+            else    { state = 2; }  // aimed at a block -> deliberately doing nothing
+        } else if (!gameFocused()) {
+            g_physDown = false;     // avoid a stuck "down" if focus was lost mid-hold
+        }
+
+        if (state != lastState) {
+            if      (state == 1) logf("[ac] autoclicking (entity/air)\n");
+            else if (state == 2) logf("[ac] aimed at block -> NOT clicking\n");
+            else if (state == 3) logf("[ac] autoclicking (no block-detect)\n");
+            else                 logf("[ac] idle\n");
+            lastState = state;
+        }
+
+        acc += PERIOD_MS;
+        DWORD s = static_cast<DWORD>(acc);
+        acc -= s; if (s < 1) s = 1;
+        Sleep(s);
+    }
+
+    g_running = false;
+
+    // Tear the hook thread down BEFORE unloading: otherwise the installed hook proc
+    // would point into freed DLL memory and crash the game on the next mouse event.
+    if (g_hookThreadId) PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+    if (g_hookThread) { WaitForSingleObject(g_hookThread, 3000); CloseHandle(g_hookThread); }
+
+    if (env && g_jvm) g_jvm->DetachCurrentThread();
+
+    fflush(stdout); if (f) fclose(f); FreeConsole();
+    FreeLibraryAndExitThread(g_self, 0);
+}
+
 static DWORD WINAPI threadMain(LPVOID) { run(); return 0; }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = hModule;
-        DisableThreadLibraryCalls(hModule);  // we don't care about thread attach/detach
-        // Never block in DllMain -- hand off to our own thread immediately.
+        DisableThreadLibraryCalls(hModule);
         HANDLE t = CreateThread(nullptr, 0, threadMain, nullptr, 0, nullptr);
         if (t) CloseHandle(t);
     }
