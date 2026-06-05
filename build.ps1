@@ -1,4 +1,4 @@
-# Builds payload.dll and injector.exe as 64-bit (matches modern Minecraft's Java).
+# Builds payload.dll, injector.exe, and password.exe as 64-bit.
 $ErrorActionPreference = "Stop"
 $flags = @("-O2", "-s", "-static", "-static-libgcc", "-static-libstdc++")
 
@@ -8,11 +8,15 @@ if (-not (Test-Path "$jdk/include/jvmti.h")) { throw "JVMTI headers not found un
 $inc = @("-I$jdk/include", "-I$jdk/include/win32")
 
 Write-Host "Building payload.dll ..." -ForegroundColor Cyan
-& g++ -shared @flags @inc -o payload.dll payload.cpp -luser32 -lgdi32 -lgdiplus -lwinmm
+& g++ -shared @flags @inc -o payload.dll payload.cpp -luser32 -lgdi32 -lgdiplus -lwinmm -lbcrypt
 if ($LASTEXITCODE -ne 0) { throw "payload.dll build failed" }
 
 Write-Host "Building injector.exe ..." -ForegroundColor Cyan
 & g++ @flags -o injector.exe injector.cpp
 if ($LASTEXITCODE -ne 0) { throw "injector.exe build failed" }
 
-Write-Host "Done. Run:  .\injector.exe   (with Minecraft open)" -ForegroundColor Green
+Write-Host "Building password.exe ..." -ForegroundColor Cyan
+& g++ @flags -o password.exe password.cpp -lbcrypt
+if ($LASTEXITCODE -ne 0) { throw "password.exe build failed" }
+
+Write-Host "Done. Run:  .\password.exe   then .\injector.exe (with Minecraft open)" -ForegroundColor Green
