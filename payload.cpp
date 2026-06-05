@@ -13,7 +13,6 @@
 //   * Autoclicker   -- master arm/disarm (also bound to the J key). Off by default.
 //   * Block Guard   -- when aimed at a block, inject nothing so blocks are never mined.
 //   * Back-Turn Slow-- drop to a low CPS when the targeted player's back is turned.
-//   * Inv. Throttle -- in a GUI with a full hotbar, space clicks past the double-click window.
 //   * Splash Pot Move-- in a container GUI, shift-click any splash potion you hover (once per
 //     slot until the inventory is reopened). Runs on its own fast thread, not the CPS pacing.
 //
@@ -21,7 +20,7 @@
 //   * A low-level mouse hook SWALLOWS your real left-click and we synthesize all clicks
 //     ourselves -- this is what lets us NOT mine a block you're holding LMB on.
 //   * While armed and holding LMB we inject clicks at the slider-set rate (drag 0-30 CPS,
-//     default 15.8). Block Guard / Back-Turn / Inv. Throttle each gate or pace those clicks.
+//     default 15.8). Block Guard / Back-Turn each gate or pace those clicks.
 //
 // Field names are resolved by trying MCP (dev) names first, then SRG (prod) names, so the
 // same DLL works in a Gradle runClient session and a shipped Forge client. If neither
@@ -66,9 +65,10 @@ static jclass        g_entityClass = nullptr; // global ref: net.minecraft.entit
 static jfieldID      g_fPosX = nullptr, g_fPosZ = nullptr, g_fYaw = nullptr;
 static bool          g_canDetectFacing = false;
 
-// For "is the hotbar full" -> EntityPlayer.inventory.mainInventory[0..8].
-static jfieldID      g_fInventory = nullptr; // EntityPlayer.inventory
-static jfieldID      g_fMainInv   = nullptr; // InventoryPlayer.mainInventory (ItemStack[])
+// For "is the hotbar full" -> EntityPlayer.inventory.mainInventory[0..8]. Used by Splash Pot Move
+// to decide whether a hovered pot can still be shift-moved to the hotbar.
+static jfieldID      g_fInventory = nullptr;  // EntityPlayer.inventory
+static jfieldID      g_fMainInv   = nullptr;  // InventoryPlayer.mainInventory (ItemStack[])
 static bool          g_canDetectHotbar = false;
 
 // For "splash-pot shift-click": when hovering a splash potion in a container GUI, shift-click it
@@ -84,6 +84,8 @@ static jclass        g_itemPotionClass = nullptr;   // global ref: ItemPotion
 static bool          g_canPotMove = false;          // all of the above resolved
 static jobject       g_lastInvScreen = nullptr;     // global ref: detect inventory reopen (pot thread only)
 static bool          g_potDone[256] = {};           // slot indices already shift-clicked this open
+static volatile bool g_potHoldClick = false;        // pot thread -> main loop: hovering a pot, don't normal-click it
+static bool          g_potShiftDown = false;         // pot thread: is LSHIFT currently held down by us?
 
 static volatile HWND g_gameWindow = nullptr;
 static volatile bool g_physDown      = false; // real (non-injected) LMB state
@@ -97,7 +99,6 @@ static volatile bool g_enabled     = false;   // master arm; starts off
 static volatile bool g_rightClicker= false;   // also rapid right-click while holding RMB
 static volatile bool g_blockGuard  = true;    // don't mine blocks
 static volatile bool g_backTurn    = true;    // slow CPS on a back-turned target
-static volatile bool g_invThrottle = true;    // space inventory clicks when hotbar full
 static volatile bool g_potMove     = false;   // shift-click splash pots you hover in a GUI
 
 // Master-toggle hotkey. Rebindable from the GUI: click the row, then press any key.
@@ -110,9 +111,6 @@ static volatile double g_cps     = 15.8;
 static const double  CPS_MIN     = 0.0;
 static const double  CPS_MAX     = 30.0;
 static const double  CPS_OFF_EPS = 0.1;          // below this we treat the clicker as paused
-// Vanilla treats two clicks on the same slot within 250 ms as a double-click. When the hotbar
-// is full we space inventory clicks beyond this so they can't gather a stack.
-static const ULONGLONG INVENTORY_MIN_MS = 300;
 // When the targeted player's back is turned, drop the click rate to this.
 static const double    BACKTURN_CPS   = 6.0;
 static const double    BACKTURN_ANGLE = 90.0;  // degrees away from "facing me" = back turned
@@ -225,20 +223,13 @@ static void sendRightClick() {
     SendInput(2, in, sizeof(INPUT));
 }
 
-// Shift + left-click of the hovered slot -> the game's quick-move (shift-click). LWJGL polls
-// keyboard state rather than reading it per-event, so we hold shift across the click with small
-// gaps (>= one client tick) instead of one atomic batch, or it may miss that shift was down.
-static void sendShiftClick() {
+// Press or release LSHIFT. The Splash Pot Move feature holds shift down the whole time the
+// cursor is over a pot, so every (instant) left click it sends lands as a quick-move/shift-click
+// without a per-click 25ms hold -- that's what lets it keep up with a fast-moving cursor.
+static void holdShift(bool down) {
     INPUT k = {}; k.type = INPUT_KEYBOARD; k.ki.wVk = VK_LSHIFT;
-    SendInput(1, &k, sizeof(INPUT));                 // shift down
-    Sleep(25);
-    INPUT m[2] = {};
-    m[0].type = INPUT_MOUSE; m[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    m[1].type = INPUT_MOUSE; m[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(2, m, sizeof(INPUT));                  // click while shift held
-    Sleep(25);
-    k.ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(1, &k, sizeof(INPUT));                 // shift up
+    if (!down) k.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &k, sizeof(INPUT));
 }
 
 // ---- JVMTI field discovery (tries MCP name, then SRG name) ------------------
@@ -348,7 +339,7 @@ static bool setupJvm(JNIEnv* env) {
     if (playerClass) { g_fInventory = findField(playerClass, "inventory", "field_71071_by", nullptr); env->DeleteGlobalRef(playerClass); }
     if (invClass)    { g_fMainInv   = findField(invClass,    "mainInventory", "field_70462_a", nullptr); env->DeleteGlobalRef(invClass); }
     g_canDetectHotbar = g_fThePlayer && g_fInventory && g_fMainInv;
-    logf("[ac] hotbar detection: %s\n", g_canDetectHotbar ? "ok" : "MISS -> no inventory throttle");
+    logf("[ac] hotbar detection: %s\n", g_canDetectHotbar ? "ok" : "MISS -> pots move regardless of hotbar");
 
     _snprintf_s(g_diag, sizeof(g_diag), _TRUNCATE, "blocks %s  \xc2\xb7  facing %s  \xc2\xb7  hotbar %s",
                 g_canDetectBlocks ? "ok" : "off", g_canDetectFacing ? "ok" : "off",
@@ -357,18 +348,8 @@ static bool setupJvm(JNIEnv* env) {
     return true;
 }
 
-// Is a GUI/screen (inventory, chat, menu...) currently open? Used to ignore the J toggle
-// while the player is typing, so 'j' in chat doesn't flip the clicker.
-static bool screenOpen(JNIEnv* env) {
-    if (!g_canDetectBlocks || !g_fCurrentScreen || !g_mcInstance) return false;
-    jobject scr = env->GetObjectField(g_mcInstance, g_fCurrentScreen);
-    bool open = (scr != nullptr);
-    if (scr) env->DeleteLocalRef(scr);
-    return open;
-}
-
 // Are all 9 hotbar slots (mainInventory[0..8]) occupied? In 1.8.9 an empty slot is null.
-// If we can't read the inventory, report "not full" so we don't throttle unexpectedly.
+// If we can't read the inventory, report "not full" so pots still move.
 static bool hotbarFull(JNIEnv* env) {
     if (!g_canDetectHotbar) return false;
     jobject me = env->GetObjectField(g_mcInstance, g_fThePlayer);
@@ -389,6 +370,16 @@ static bool hotbarFull(JNIEnv* env) {
     }
     env->DeleteLocalRef(main);
     return full;
+}
+
+// Is a GUI/screen (inventory, chat, menu...) currently open? Used to ignore the J toggle
+// while the player is typing, so 'j' in chat doesn't flip the clicker.
+static bool screenOpen(JNIEnv* env) {
+    if (!g_canDetectBlocks || !g_fCurrentScreen || !g_mcInstance) return false;
+    jobject scr = env->GetObjectField(g_mcInstance, g_fCurrentScreen);
+    bool open = (scr != nullptr);
+    if (scr) env->DeleteLocalRef(scr);
+    return open;
 }
 
 // True if the targeted entity's back is turned to us (it is facing away). Compares the
@@ -484,9 +475,11 @@ static bool ensurePotRefs(JNIEnv* env) {
     return g_canPotMove;
 }
 
-// Dedicated fast thread (~tick-rate, NOT gated by the CPS pacing): while a container GUI is
-// open and the hovered slot holds a splash potion, shift-click it once, then blacklist that
-// slot index until the inventory is closed/reopened.
+// Dedicated fast thread (~tick-rate, NOT gated by the CPS pacing): only while the autoclicker is
+// actively left-clicking (armed + holding LMB) and a container GUI is open. When the hovered slot
+// holds a splash potion it (a) tells the main loop to hold fire on that slot via g_potHoldClick so
+// the autoclicker can't double-click/gather the pot, and (b) shift-clicks it to the hotbar -- but
+// only while the hotbar has room. Once the hotbar is full it just holds; the pot stays put.
 static DWORD WINAPI potThread(LPVOID) {
     JNIEnv* env = nullptr;
     if (!g_jvm || g_jvm->AttachCurrentThread(reinterpret_cast<void**>(&env), nullptr) != JNI_OK || !env) {
@@ -499,8 +492,10 @@ static DWORD WINAPI potThread(LPVOID) {
     auto nextTick = clock::now();
 
     while (g_running) {
-        bool active = g_potMove && g_mcInstance && g_fCurrentScreen &&
+        // Only act while the autoclicker is actually left-clicking (armed + holding LMB) in-game.
+        bool active = g_potMove && g_enabled && g_physDown && g_mcInstance && g_fCurrentScreen &&
                       g_gameWindow && GetForegroundWindow() == g_gameWindow;
+        bool block = false;   // hovering a splash pot this tick -> main loop must not normal-click it
         if (active) {
             jobject scr = env->GetObjectField(g_mcInstance, g_fCurrentScreen);
             if (scr) {
@@ -514,26 +509,32 @@ static DWORD WINAPI potThread(LPVOID) {
                     jobject slot = env->GetObjectField(scr, g_fTheSlot);  // hovered slot, or null
                     if (slot) {
                         jint sn = env->GetIntField(slot, g_fSlotNumber);
-                        bool ignored = (sn >= 0 && sn < 256 && g_potDone[sn]);
-                        if (!ignored) {
-                            jobject stack = env->CallObjectMethod(slot, g_midGetStack);
+                        // Read the slot every tick (even if already clicked) so we keep holding while
+                        // the pot is still there -- it only stops once the click has actually moved it.
+                        jobject stack = env->CallObjectMethod(slot, g_midGetStack);
+                        if (env->ExceptionCheck()) env->ExceptionClear();
+                        if (stack) {
+                            jobject item = env->CallObjectMethod(stack, g_midGetItem);
                             if (env->ExceptionCheck()) env->ExceptionClear();
-                            if (stack) {
-                                jobject item = env->CallObjectMethod(stack, g_midGetItem);
-                                if (env->ExceptionCheck()) env->ExceptionClear();
-                                jint meta = env->CallIntMethod(stack, g_midGetMeta);
-                                if (env->ExceptionCheck()) env->ExceptionClear();
-                                // 1.8.9: a potion is a splash when bit 0x4000 is set in its metadata.
-                                bool splash = item && env->IsInstanceOf(item, g_itemPotionClass) &&
-                                              (meta & 0x4000) != 0;
-                                if (splash) {
-                                    sendShiftClick();
+                            jint meta = env->CallIntMethod(stack, g_midGetMeta);
+                            if (env->ExceptionCheck()) env->ExceptionClear();
+                            // 1.8.9: a potion is a splash when bit 0x4000 is set in its metadata.
+                            bool splash = item && env->IsInstanceOf(item, g_itemPotionClass) &&
+                                          (meta & 0x4000) != 0;
+                            if (splash) {
+                                block = true;
+                                bool ignored = (sn >= 0 && sn < 256 && g_potDone[sn]);
+                                // Move it to the hotbar only while there's room. Once the hotbar is
+                                // full we just hold so it can't be double-clicked / gathered.
+                                if (!ignored && !hotbarFull(env)) {
+                                    if (!g_potShiftDown) { holdShift(true); g_potShiftDown = true; }
+                                    sendClick();   // instant left click, shift held -> quick-move
                                     if (sn >= 0 && sn < 256) g_potDone[sn] = true;
                                     logf("[ac] pot shift-click slot %d (meta 0x%X)\n", (int)sn, (unsigned)meta);
                                 }
-                                if (item) env->DeleteLocalRef(item);
-                                env->DeleteLocalRef(stack);
                             }
+                            if (item) env->DeleteLocalRef(item);
+                            env->DeleteLocalRef(stack);
                         }
                         env->DeleteLocalRef(slot);
                     }
@@ -545,12 +546,20 @@ static DWORD WINAPI potThread(LPVOID) {
                 memset(g_potDone, 0, sizeof(g_potDone));
             }
         }
+
+        // Hold shift exactly while the cursor is on a pot (so the main loop's non-pot L/R clicks
+        // are never turned into shift-clicks); release it the instant we leave a pot or go idle.
+        if (block) { if (!g_potShiftDown) { holdShift(true);  g_potShiftDown = true;  } }
+        else       { if ( g_potShiftDown) { holdShift(false); g_potShiftDown = false; } }
+        g_potHoldClick = block;   // set AFTER the shift release so the main loop never clicks with shift down
+
         nextTick += std::chrono::milliseconds(1);   // independent of the click-speed slider
         auto tnow = clock::now();
-        if (nextTick < tnow) nextTick = tnow;        // fell behind (e.g. after a shift-click) -> don't spiral
+        if (nextTick < tnow) nextTick = tnow;
         std::this_thread::sleep_until(nextTick);
     }
 
+    if (g_potShiftDown) { holdShift(false); g_potShiftDown = false; }   // never leave shift stuck down
     if (g_lastInvScreen) { env->DeleteGlobalRef(g_lastInvScreen); g_lastInvScreen = nullptr; }
     if (g_jvm) g_jvm->DetachCurrentThread();
     return 0;
@@ -561,9 +570,9 @@ static DWORD WINAPI potThread(LPVOID) {
 // ============================================================================
 using namespace Gdiplus;
 
-static const int   WIN_W = 360, WIN_H = 718;
+static const int   WIN_W = 360, WIN_H = 652;
 static const int   TOG_X = 22, TOG_W = WIN_W - 44, TOG_H = 54, TOG_GAP = 12, TOG_Y0 = 120;
-static const int   N_TOGGLES = 6;
+static const int   N_TOGGLES = 5;
 
 struct ToggleDef { const wchar_t* label; const wchar_t* hint; volatile bool* state; };
 static ToggleDef g_toggles[N_TOGGLES] = {
@@ -571,7 +580,6 @@ static ToggleDef g_toggles[N_TOGGLES] = {
     { L"Right Clicker",  L"rapid RMB use",       &g_rightClicker},
     { L"Block Guard",    L"never mine blocks",   &g_blockGuard  },
     { L"Back-Turn Slow", L"ease off back-stabs", &g_backTurn    },
-    { L"Inv. Throttle",  L"no stack double-tap", &g_invThrottle },
     { L"Splash Pot Move",L"shift-click pots in GUI", &g_potMove  },
 };
 static RECT g_togRc[N_TOGGLES];
@@ -1044,6 +1052,7 @@ static void run() {
 
     int  lastState = -99;
     bool lastKey = false;
+    bool invLeftNext = true;   // in a GUI, alternate left/right clicks so we never double-click
 
     while (g_running) {
         if (GetAsyncKeyState(VK_END) & 0x8000) { logf("[ac] END pressed -- unloading.\n"); break; }
@@ -1090,14 +1099,19 @@ static void run() {
         int state = 0;
         if (g_enabled && g_physDown && gameFocused() && !off) {
             if (env && screenOpen(env)) {
-                // In a screen (inventory/chest/...). No blocks here. Only when Inv. Throttle is on
-                // AND the hotbar is full do we space clicks past the double-click window.
-                if (g_invThrottle && hotbarFull(env)) {
-                    double gap = baseGap > (double)INVENTORY_MIN_MS ? baseGap : (double)INVENTORY_MIN_MS;
-                    if (msSince(lastClick) >= gap) { sendClick(); lastClick = now; }
+                // In a screen (inventory/chest/...). Hold fire on a hovered pot -- Splash Pot Move
+                // handles those via shift-click. Otherwise click at the full set CPS, alternating
+                // left/right: Minecraft only registers a (stack-gathering) double-click when the
+                // SAME button hits the same slot twice within 250 ms, so alternating buttons makes
+                // a double-click impossible at any speed -> high CPS in the inventory, never gathers.
+                if (g_potHoldClick) {
                     state = 6;
                 } else {
-                    if (msSince(lastClick) >= baseGap) { sendClick(); lastClick = now; }
+                    if (msSince(lastClick) >= baseGap) {
+                        if (invLeftNext) sendClick(); else sendRightClick();
+                        invLeftNext = !invLeftNext;
+                        lastClick = now;
+                    }
                     state = 4;
                 }
             } else {
@@ -1132,7 +1146,7 @@ static void run() {
         // Status line. Combine left `state` with the right-click flag so toggling either reprints.
         int combo = state * 2 + (rightActive ? 1 : 0);
         if (combo != lastState) {
-            bool leftClicking = (state == 1 || state == 3 || state == 4 || state == 5 || state == 6);
+            bool leftClicking = (state == 1 || state == 3 || state == 4 || state == 5);
             if      (!g_enabled)             setStatus("disarmed \xc2\xb7 hotkey or button to arm");
             else if (rightActive && leftClicking) setStatus("left + right clicking");
             else if (rightActive)            setStatus("right-clicking \xc2\xb7 hold RMB");
@@ -1140,9 +1154,9 @@ static void run() {
             else if (state == 1) setStatus("clicking \xc2\xb7 entity / air");
             else if (state == 2) setStatus("aimed at block \xc2\xb7 holding fire");
             else if (state == 3) setStatus("clicking \xc2\xb7 no block-detect");
-            else if (state == 4) setStatus("clicking \xc2\xb7 inventory");
+            else if (state == 4) setStatus("clicking \xc2\xb7 inventory L/R");
             else if (state == 5) setStatus("back turned \xc2\xb7 6 CPS");
-            else if (state == 6) setStatus("inventory \xc2\xb7 hotbar full");
+            else if (state == 6) setStatus("pot \xc2\xb7 holding (shift-move)");
             lastState = combo;
         }
 
