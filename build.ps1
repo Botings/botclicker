@@ -8,7 +8,7 @@ if (-not (Test-Path "$jdk/include/jvmti.h")) { throw "JVMTI headers not found un
 $inc = @("-I$jdk/include", "-I$jdk/include/win32")
 
 Write-Host "Building payload.dll ..." -ForegroundColor Cyan
-& g++ -shared @flags @inc -o payload.dll payload.cpp -luser32
+& g++ -shared @flags @inc -o payload.dll payload.cpp -luser32 -lgdi32 -lgdiplus -lwinmm
 if ($LASTEXITCODE -ne 0) { throw "payload.dll build failed" }
 
 Write-Host "Building injector.exe ..." -ForegroundColor Cyan
