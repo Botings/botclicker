@@ -6,21 +6,21 @@
 //
 // UI: instead of a text console, the agent opens "BotClicker" -- a small frameless,
 // always-on-top GDI+ window (dark space-blue theme). Each feature is a toggle button that
-// glows GREEN when on and RED when off. Drag it by the title bar; the little X (or END)
+// glows GREEN when on and RED when off. Drag it by the title bar; the little X
 // unloads cleanly.
 //
 // Toggles:
 //   * Autoclicker   -- master arm/disarm (also bound to the J key). Off by default.
-//   * Block Guard   -- when aimed at a block, inject nothing so blocks are never mined.
 //   * Back-Turn Slow-- drop to a low CPS when the targeted player's back is turned.
 // Splash Pot Move is always on: in a container GUI, while you hold Shift, click splash potions
 // you hover into the hotbar. Runs on its own fast thread, not the CPS pacing.
 //
 // Behaviour (only while Minecraft is the foreground window):
-//   * A low-level mouse hook SWALLOWS your real left-click and we synthesize all clicks
-//     ourselves -- this is what lets us NOT mine a block you're holding LMB on.
+//   * A low-level mouse hook watches your real left-click: in a container GUI it seizes
+//     Shift+LMB to inject clean clicks; in the world it passes the hold through and layers
+//     our own click-edges on top.
 //   * While armed and holding LMB we inject clicks at the slider-set rate (drag 0-30 CPS,
-//     default 15.8). Block Guard / Back-Turn each gate or pace those clicks.
+//     default 15.8). Back-Turn paces those clicks when a targeted player's back is turned.
 //
 // Field names are resolved by trying MCP (dev) names first, then SRG (prod) names, so the
 // same DLL works in a Gradle runClient session and a shipped Forge client. If neither
@@ -55,6 +55,7 @@ static jclass        g_mcClass    = nullptr;  // global ref: net.minecraft.clien
 static jobject       g_mcInstance = nullptr;  // global ref: the Minecraft singleton
 static jfieldID      g_fObjMouseOver = nullptr;
 static jfieldID      g_fCurrentScreen = nullptr;
+static jfieldID      g_fLeftClickCounter = nullptr; // Minecraft.leftClickCounter, vanilla miss-hit delay
 static jclass        g_mopClass   = nullptr;  // global ref: MovingObjectPosition (lazy)
 static jfieldID      g_fTypeOfHit = nullptr;  // lazy
 static jfieldID      g_fEntityHit = nullptr;  // lazy: MovingObjectPosition.entityHit
@@ -86,6 +87,16 @@ static jmethodID     g_midGetMeta = nullptr;        // ItemStack.getMetadata()
 static jclass        g_itemPotionClass = nullptr;   // global ref: ItemPotion
 static bool          g_canPotMove = false;          // all of the above resolved
 static jobject       g_lastInvScreen = nullptr;     // global ref: detect inventory reopen (pot thread only)
+
+// Right-clicker gate: only auto-right-click while a block or bucket is the selected hotbar item, so
+// a plain right-click still works for swords, food, bows, ender pearls, etc. The (JNI-less) mouse
+// hook can't call into the JVM, so the worker refreshes g_holdingPlaceable each tick and the hook
+// just reads that cached flag.
+static jfieldID      g_fCurrentItem    = nullptr;   // InventoryPlayer.currentItem (selected hotbar slot 0-8)
+static jmethodID     g_midGetCurItem   = nullptr;   // InventoryPlayer.getCurrentItem() (independent fallback)
+static jclass        g_itemBlockClass  = nullptr;   // global ref: ItemBlock (covers its subclasses)
+static jclass        g_itemBucketClass = nullptr;   // global ref: ItemBucket (empty/water/lava)
+static bool          g_canDetectHeld   = false;     // enough held-item refs resolved to read the held item
 static ULONGLONG     g_potLastClick[256] = {};      // last shift-click attempt per slot
 static volatile bool g_potHoldClick = false;        // pot thread -> main loop: hovering a pot, don't normal-click it
 
@@ -100,6 +111,7 @@ static volatile bool g_physRightDown = false; // real (non-injected) RMB state
 static volatile bool g_screenOpen = false;
 static volatile bool g_guiLeftSeized = false;   // true after swallowing a Shift+LMB GUI press
 static volatile bool g_guiRightSeized = false;  // true after swallowing a Shift+RMB GUI press
+static volatile bool g_holdingPlaceable = false; // worker->hook: selected hotbar item is a block/bucket
 static HHOOK         g_mouseHook   = nullptr;
 static HANDLE        g_hookThread  = nullptr;
 static DWORD         g_hookThreadId = 0;
@@ -107,8 +119,7 @@ static DWORD         g_hookThreadId = 0;
 // ---- toggleable options (shared with the GUI) ------------------------------
 static volatile bool g_enabled     = false;   // master arm; starts off
 static volatile bool g_rightClicker= false;   // also rapid right-click while holding RMB
-static volatile bool g_blockGuard  = true;    // don't mine blocks
-static volatile bool g_backTurn    = true;    // slow CPS on a back-turned target
+static volatile bool g_backTurn    = false;   // optional slow CPS on a back-turned target
 static volatile bool g_potMove     = true;    // always shift-click splash pots you hover in a GUI
 static volatile bool g_authenticated = false; // password gate passed for this injection
 
@@ -189,8 +200,17 @@ static HWND findGameWindow() {
 static inline bool gameFocused() {
     HWND g = g_gameWindow;
     HWND fg = GetForegroundWindow();
-    // Treat our own overlay as "the game has focus" so clicking a toggle doesn't disarm us.
+    // Treat our own overlay as "the game has focus" so the hotkey toggle still fires while a
+    // toggle/slider is being clicked. NOTE: do NOT use this to gate click injection -- see
+    // gameForeground() below, or we'd inject clicks onto our own GUI.
     return g && (fg == g || fg == g_hwnd);
+}
+// Strictly the real game window in the foreground -- NOT our overlay. Click injection is gated on
+// this so the autoclicker only fires while Minecraft itself is the active window; interacting with
+// the BotClicker GUI never triggers (or receives) injected clicks.
+static inline bool gameForeground() {
+    HWND g = g_gameWindow;
+    return g && GetForegroundWindow() == g;
 }
 
 static inline bool physicalShiftHeld() {
@@ -227,21 +247,22 @@ static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
                 if (swallow) return 1;
             }
             else if (g_rightClicker) {
-                // Right button is seized for the right-clicker. In GUIs, require Shift just like LMB
-                // so normal right-click inventory actions still work when Shift is not held.
+                // Only take over the right button when auto-clicking actually makes sense: a block or
+                // bucket in hand out in the world, or Shift held in a container GUI. Anything else
+                // (sword, food, bow, pearls, plain GUI clicks) passes straight through, so its normal
+                // right-click still works. g_holdingPlaceable is refreshed by the worker each tick.
                 if (w == WM_RBUTTONDOWN) {
-                    if (screen) {
-                        g_guiRightSeized = shift;
-                        g_physRightDown = shift;
-                        if (shift) return 1;
-                    } else {
-                        g_guiRightSeized = false;
+                    bool seize = screen ? shift : g_holdingPlaceable;
+                    if (seize) {
+                        g_guiRightSeized = screen;
                         g_physRightDown = true;
                         return 1;
                     }
+                    g_guiRightSeized = false;
+                    g_physRightDown = false;
                 }
                 if (w == WM_RBUTTONUP) {
-                    bool swallow = g_guiRightSeized || !screen;
+                    bool swallow = g_physRightDown;   // only swallow the up of a hold we actually seized
                     g_physRightDown = false;
                     g_guiRightSeized = false;
                     if (swallow) return 1;
@@ -333,6 +354,8 @@ static jmethodID findMethod(JNIEnv* env, jclass klass, const char* mcp, const ch
     return m;
 }
 
+static bool ensureHeldRefs(JNIEnv* env);   // defined below; setupJvm resolves it eagerly for diagnostics
+
 static bool setupJvm(JNIEnv* env) {
     // jvm.dll is already loaded in javaw; resolve the entrypoint dynamically.
     HMODULE jvmDll = GetModuleHandleA("jvm.dll");
@@ -356,6 +379,7 @@ static bool setupJvm(JNIEnv* env) {
     jfieldID fTheMc = findField(g_mcClass, "theMinecraft", "field_71432_P", &isStatic);
     g_fObjMouseOver  = findField(g_mcClass, "objectMouseOver", "field_71476_x", nullptr);
     g_fCurrentScreen = findField(g_mcClass, "currentScreen",   "field_71462_r", nullptr);
+    g_fLeftClickCounter = findField(g_mcClass, "leftClickCounter", "field_71429_W", nullptr);
 
     if (fTheMc && isStatic) {
         jobject mc = env->GetStaticObjectField(g_mcClass, fTheMc);
@@ -371,6 +395,7 @@ static bool setupJvm(JNIEnv* env) {
          g_mcInstance ? "ok" : "MISS", g_fObjMouseOver ? "ok" : "MISS", g_fCurrentScreen ? "ok" : "MISS");
     if (!g_canDetectBlocks)
         logf("[ac] WARNING: block detection unavailable -> will click everywhere (incl. blocks).\n");
+    logf("[ac] vanilla hit-delay reset: %s\n", g_fLeftClickCounter ? "ok" : "MISS");
 
     // Entity facing fields: Minecraft.thePlayer + Entity.{posX,posZ,rotationYaw}. Field IDs taken
     // from the Entity base class are valid for any subclass instance (the player and the target).
@@ -394,11 +419,24 @@ static bool setupJvm(JNIEnv* env) {
     g_canDetectHotbar = g_fThePlayer && g_fInventory && g_fMainInv;
     logf("[ac] hotbar detection: %s\n", g_canDetectHotbar ? "ok" : "MISS -> pots move regardless of hotbar");
 
-    _snprintf_s(g_diag, sizeof(g_diag), _TRUNCATE, "blocks %s  \xc2\xb7  facing %s  \xc2\xb7  hotbar %s",
-                g_canDetectBlocks ? "ok" : "off", g_canDetectFacing ? "ok" : "off",
-                g_canDetectHotbar ? "ok" : "off");
+    // Held-item detection for the right-clicker (block/bucket gate). Resolve it now so its status
+    // shows in the diagnostics line; it also retries lazily if a class wasn't loaded this early.
+    ensureHeldRefs(env);
+    logf("[ac] held-item detection: %s\n", g_canDetectHeld ? "ok" : "MISS -> right-clicker stays idle");
+
+    _snprintf_s(g_diag, sizeof(g_diag), _TRUNCATE,
+                "blocks %s \xc2\xb7 delay %s \xc2\xb7 facing %s \xc2\xb7 hotbar %s \xc2\xb7 held %s",
+                g_canDetectBlocks ? "ok" : "off", g_fLeftClickCounter ? "ok" : "off",
+                g_canDetectFacing ? "ok" : "off", g_canDetectHotbar ? "ok" : "off",
+                g_canDetectHeld ? "ok" : "off");
     requestRepaint();
     return true;
+}
+
+static void clearLeftClickDelay(JNIEnv* env) {
+    if (!env || !g_mcInstance || !g_fLeftClickCounter) return;
+    env->SetIntField(g_mcInstance, g_fLeftClickCounter, 0);
+    if (env->ExceptionCheck()) env->ExceptionClear();
 }
 
 // Are all 9 hotbar slots (mainInventory[0..8]) occupied? In 1.8.9 an empty slot is null.
@@ -423,6 +461,81 @@ static bool hotbarFull(JNIEnv* env) {
     }
     env->DeleteLocalRef(main);
     return full;
+}
+
+// Resolve everything needed to read the player's selected hotbar item. TWO independent ways to fetch
+// the held stack are resolved -- mainInventory[currentItem] AND InventoryPlayer.getCurrentItem() --
+// so a single unmapped name can't kill the feature. Plus ItemStack.getItem() (shared with the pot
+// path) and the ItemBlock / ItemBucket classes. MCP names first, then SRG: works dev and prod.
+static bool ensureHeldRefs(JNIEnv* env) {
+    if (g_canDetectHeld) return true;
+    jclass invC = findLoadedClass(env, "Lnet/minecraft/entity/player/InventoryPlayer;");
+    if (invC) {
+        if (!g_fCurrentItem)  g_fCurrentItem  = findField(invC, "currentItem",   "field_70461_c", nullptr);
+        if (!g_fMainInv)      g_fMainInv      = findField(invC, "mainInventory", "field_70462_a", nullptr);
+        if (!g_midGetCurItem) g_midGetCurItem = findMethod(env, invC, "getCurrentItem", "func_70448_g",
+                                                           "()Lnet/minecraft/item/ItemStack;");
+        env->DeleteGlobalRef(invC);
+    }
+    if (!g_midGetItem) {
+        jclass stackC = findLoadedClass(env, "Lnet/minecraft/item/ItemStack;");
+        if (stackC) {
+            g_midGetItem = findMethod(env, stackC, "getItem", "func_77973_b",
+                                      "()Lnet/minecraft/item/Item;");
+            env->DeleteGlobalRef(stackC);
+        }
+    }
+    if (!g_itemBlockClass)  g_itemBlockClass  = findLoadedClass(env, "Lnet/minecraft/item/ItemBlock;");
+    if (!g_itemBucketClass) g_itemBucketClass = findLoadedClass(env, "Lnet/minecraft/item/ItemBucket;");
+
+    bool canFetch = (g_fMainInv && g_fCurrentItem) || g_midGetCurItem;   // either path is enough
+    g_canDetectHeld = g_fThePlayer && g_fInventory && g_midGetItem &&
+                      g_itemBlockClass && g_itemBucketClass && canFetch;
+    return g_canDetectHeld;
+}
+
+// The player's selected hotbar ItemStack (a local ref the caller must release), or null for an empty
+// hand. Prefers mainInventory[currentItem]; falls back to getCurrentItem() if that path isn't mapped.
+static jobject heldStack(JNIEnv* env, jobject inv) {
+    if (g_fMainInv && g_fCurrentItem) {
+        jint sel = env->GetIntField(inv, g_fCurrentItem);
+        jobjectArray main = static_cast<jobjectArray>(env->GetObjectField(inv, g_fMainInv));
+        if (main) {
+            jobject st = (sel >= 0 && sel < 9) ? env->GetObjectArrayElement(main, sel) : nullptr;
+            if (env->ExceptionCheck()) { env->ExceptionClear(); st = nullptr; }
+            env->DeleteLocalRef(main);
+            if (st) return st;
+        }
+    }
+    if (g_midGetCurItem) {
+        jobject st = env->CallObjectMethod(inv, g_midGetCurItem);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
+        return st;
+    }
+    return nullptr;
+}
+
+// True only if the player's selected hotbar item is a block or a (water/lava/empty) bucket. If we
+// can't read the item we return FALSE: auto-right-clicking an unknown item (bow, pearls, food) is
+// worse than not firing.
+static bool holdingPlaceable(JNIEnv* env) {
+    if (!ensureHeldRefs(env)) return false;
+    jobject me = env->GetObjectField(g_mcInstance, g_fThePlayer);
+    if (!me) return false;
+    jobject inv = env->GetObjectField(me, g_fInventory);
+    env->DeleteLocalRef(me);
+    if (!inv) return false;
+    jobject stack = heldStack(env, inv);
+    env->DeleteLocalRef(inv);
+    if (!stack) return false;                        // empty hand
+    jobject item = env->CallObjectMethod(stack, g_midGetItem);
+    env->DeleteLocalRef(stack);
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+    if (!item) return false;
+    bool placeable = env->IsInstanceOf(item, g_itemBlockClass) ||
+                     env->IsInstanceOf(item, g_itemBucketClass);
+    env->DeleteLocalRef(item);
+    return placeable;
 }
 
 // Is a GUI/screen (inventory, chat, menu...) currently open? Used to ignore the J toggle
@@ -466,7 +579,7 @@ static bool targetBackTurned(JNIEnv* env, jobject mop) {
 //   EVAL_ALLOW    -> click at full CPS (air, or an entity facing us)
 //   EVAL_BLOCK    -> aimed at a block, do not click
 //   EVAL_BACKTURN -> entity with its back turned, click at reduced CPS
-static int evalTarget(JNIEnv* env) {
+static int evalTarget(JNIEnv* env, bool detectBackTurn) {
     if (!g_canDetectBlocks) return EVAL_ALLOW;  // degraded mode
 
     jobject mop = env->GetObjectField(g_mcInstance, g_fObjMouseOver);
@@ -488,7 +601,7 @@ static int evalTarget(JNIEnv* env) {
             if (env->ExceptionCheck()) env->ExceptionClear();
             env->DeleteLocalRef(t);
             if (ord == 1) result = EVAL_BLOCK;
-            else if (ord == 2 && targetBackTurned(env, mop)) result = EVAL_BACKTURN;
+            else if (ord == 2 && detectBackTurn && targetBackTurned(env, mop)) result = EVAL_BACKTURN;
         }
     }
     env->DeleteLocalRef(mop);
@@ -706,15 +819,14 @@ static DWORD WINAPI potThread(LPVOID) {
 // ============================================================================
 using namespace Gdiplus;
 
-static const int   WIN_W = 360, WIN_H = 652;
+static const int   WIN_W = 360, WIN_H = 586;   // 3 toggles + slider + hotkey + status
 static const int   TOG_X = 22, TOG_W = WIN_W - 44, TOG_H = 54, TOG_GAP = 12, TOG_Y0 = 120;
-static const int   N_TOGGLES = 4;
+static const int   N_TOGGLES = 3;
 
 struct ToggleDef { const wchar_t* label; const wchar_t* hint; volatile bool* state; };
 static ToggleDef g_toggles[N_TOGGLES] = {
     { L"Autoclicker",    L"left-click (hotkey)", &g_enabled     },
-    { L"Right Clicker",  L"rapid RMB use",       &g_rightClicker},
-    { L"Block Guard",    L"on: never mine; off: dig normally", &g_blockGuard  },
+    { L"Right Clicker",  L"blocks & buckets only", &g_rightClicker},
     { L"Back-Turn Slow", L"ease off back-stabs", &g_backTurn    },
 };
 static RECT g_togRc[N_TOGGLES];
@@ -724,8 +836,12 @@ static bool g_cpsEdit    = false;    // right-clicked the slider -> typing a CPS
 static wchar_t g_cpsBuf[16] = L"";   // the digits being typed while g_cpsEdit
 static RECT g_keyRc;                 // the "Toggle Hotkey" row
 static RECT g_closeRc = { WIN_W - 40, 14, WIN_W - 16, 38 };
+static RECT g_minRc   = { WIN_W - 72, 14, WIN_W - 48, 38 };   // minimize, left of close
+static const int COLLAPSED_H = 64;   // window height while minimized (just the title bar)
+static bool g_minimized = false;     // collapsed to the title bar
 static int  g_hover = -1;            // hovered toggle index, or -1
 static bool g_hoverClose = false;
+static bool g_hoverMin   = false;
 static bool g_hoverKey   = false;
 static ULONG_PTR g_gdipToken = 0;
 
@@ -802,6 +918,30 @@ static void submitAuthCode() {
         logf("[ac] password rejected\n");
     }
     requestRepaint();
+}
+
+// Paste the auth code from the clipboard (Ctrl+V on the locked screen). Pulls up to 6 digit chars
+// out of whatever text is on the clipboard, ignoring spaces/other characters, and auto-submits once
+// 6 are in. Replaces the field rather than appending, so a copied code always lands exactly.
+static void pasteAuthFromClipboard(HWND hwnd) {
+    if (!OpenClipboard(hwnd)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        const wchar_t* clip = static_cast<const wchar_t*>(GlobalLock(h));
+        if (clip) {
+            size_t n = 0;
+            for (const wchar_t* p = clip; *p && n < 6; ++p)
+                if (*p >= L'0' && *p <= L'9') g_authBuf[n++] = *p;
+            g_authBuf[n] = 0;
+            g_authBad = false;
+            GlobalUnlock(h);
+            CloseClipboard();
+            if (n == 6) submitAuthCode();   // full code pasted -> unlock straight away
+            else requestRepaint();
+            return;
+        }
+    }
+    CloseClipboard();
 }
 
 static Color C(BYTE r, BYTE g, BYTE b, BYTE a = 255) { return Color(a, r, g, b); }
@@ -912,15 +1052,31 @@ static void paint(HWND hwnd, HDC hdc) {
             g.DrawLine(&xp, cr.X + cr.Width - pad, cr.Y + pad, cr.X + pad, cr.Y + cr.Height - pad);
         }
 
+        // ---- minimize / restore button (left of close) ----
+        {
+            RectF mr((REAL)g_minRc.left, (REAL)g_minRc.top,
+                     (REAL)(g_minRc.right - g_minRc.left), (REAL)(g_minRc.bottom - g_minRc.top));
+            fillRound(g, g_hoverMin ? C(54, 86, 150) : C(34, 44, 72), mr, 7.0f);
+            Pen mp(g_hoverMin ? C(235, 242, 255) : C(150, 165, 200), 1.8f);
+            REAL pad = 7;
+            if (g_minimized) {  // restore glyph: a small square
+                g.DrawRectangle(&mp, mr.X + pad, mr.Y + pad, mr.Width - 2 * pad, mr.Height - 2 * pad);
+            } else {            // minimize glyph: a dash near the bottom
+                g.DrawLine(&mp, mr.X + pad, mr.Y + mr.Height - pad, mr.X + mr.Width - pad, mr.Y + mr.Height - pad);
+            }
+        }
+
         wchar_t wbuf[128];
-        if (!g_authenticated) {
+        if (g_minimized) {
+            // collapsed: only the title bar + buttons are shown; skip the body entirely.
+        } else if (!g_authenticated) {
             RectF card(22.0f, 164.0f, (REAL)(WIN_W - 44), 210.0f);
             fillRound(g, C(21, 29, 52), card, 13.0f);
             strokeRound(g, g_authBad ? C(214, 82, 82) : C(40, 52, 86), 1.2f, card, 13.0f);
 
             SolidBrush txt(C(228, 235, 250)), hint(C(118, 132, 168));
             g.DrawString(L"Locked", -1, fLabel, RectF(card.X + 24, card.Y + 22, card.Width - 48, 22), &sfL, &txt);
-            g.DrawString(L"Password", -1, fHint, RectF(card.X + 24, card.Y + 56, card.Width - 48, 16), &sfL, &hint);
+            g.DrawString(L"Password  \xb7  type or paste (Ctrl+V)", -1, fHint, RectF(card.X + 24, card.Y + 56, card.Width - 48, 16), &sfL, &hint);
 
             RectF input(card.X + 24, card.Y + 78, card.Width - 48, 46);
             fillRound(g, C(12, 18, 34), input, 9.0f);
@@ -1095,8 +1251,18 @@ static void paint(HWND hwnd, HDC hdc) {
     DeleteDC(mem);
 }
 
+// Collapse to / expand from the title bar. Resizes the window and reshapes its rounded region.
+static void applyMinimizedState(HWND hwnd) {
+    int h = g_minimized ? COLLAPSED_H : WIN_H;
+    SetWindowPos(hwnd, nullptr, 0, 0, WIN_W, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    HRGN rgn = CreateRoundRectRgn(0, 0, WIN_W + 1, h + 1, 22, 22);
+    SetWindowRgn(hwnd, rgn, TRUE);   // window takes ownership of rgn
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 static void toggleAt(int x, int y) {
     if (inRect(g_closeRc, x, y)) { PostMessageW(g_hwnd, WM_CLOSE, 0, 0); return; }
+    if (inRect(g_minRc, x, y)) { g_minimized = !g_minimized; applyMinimizedState(g_hwnd); return; }
     if (!g_authenticated) return;
     for (int i = 0; i < N_TOGGLES; i++) {
         if (inRect(g_togRc[i], x, y)) {
@@ -1142,11 +1308,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         int hov = -1;
-        for (int i = 0; i < N_TOGGLES; i++) if (inRect(g_togRc[i], x, y)) { hov = i; break; }
+        if (!g_minimized)
+            for (int i = 0; i < N_TOGGLES; i++) if (inRect(g_togRc[i], x, y)) { hov = i; break; }
         bool hc = inRect(g_closeRc, x, y);
-        bool hk = inRect(g_keyRc, x, y);
-        if (hov != g_hover || hc != g_hoverClose || hk != g_hoverKey) {
-            g_hover = hov; g_hoverClose = hc; g_hoverKey = hk;
+        bool hm = inRect(g_minRc, x, y);
+        bool hk = !g_minimized && inRect(g_keyRc, x, y);
+        if (hov != g_hover || hc != g_hoverClose || hm != g_hoverMin || hk != g_hoverKey) {
+            g_hover = hov; g_hoverClose = hc; g_hoverMin = hm; g_hoverKey = hk;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
@@ -1154,8 +1322,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE:
-        if (g_hover != -1 || g_hoverClose || g_hoverKey) {
-            g_hover = -1; g_hoverClose = false; g_hoverKey = false;
+        if (g_hover != -1 || g_hoverClose || g_hoverMin || g_hoverKey) {
+            g_hover = -1; g_hoverClose = false; g_hoverMin = false; g_hoverKey = false;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -1177,6 +1345,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             size_t n = wcslen(g_authBuf);
             if (ch == 13) {
                 submitAuthCode();
+            } else if (ch == 22) {              // Ctrl+V -> paste the code from the clipboard
+                pasteAuthFromClipboard(hwnd);
             } else if (ch == 27) {
                 g_authBuf[0] = 0;
                 g_authBad = false;
@@ -1211,7 +1381,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (!g_authenticated) {
-            if (inRect(g_closeRc, x, y)) { toggleAt(x, y); return 0; }
+            if (inRect(g_closeRc, x, y) || inRect(g_minRc, x, y)) { toggleAt(x, y); return 0; }
             SetFocus(hwnd);
             if (y < 104) {
                 ReleaseCapture();
@@ -1233,8 +1403,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             requestRepaint();
             return 0;
         }
-        bool onToggle = inRect(g_closeRc, x, y);
-        for (int i = 0; i < N_TOGGLES; i++) if (inRect(g_togRc[i], x, y)) onToggle = true;
+        bool onToggle = inRect(g_closeRc, x, y) || inRect(g_minRc, x, y);
+        if (!g_minimized)
+            for (int i = 0; i < N_TOGGLES; i++) if (inRect(g_togRc[i], x, y)) onToggle = true;
         if (onToggle) { toggleAt(x, y); return 0; }
         if (y < 104) {  // title strip -> drag the window
             ReleaseCapture();
@@ -1318,7 +1489,7 @@ static void run() {
         setupJvm(env);
     }
 
-    logf("[ac] running at %.1f CPS (slider 0-30). J or the Autoclicker button arms it. END unloads.\n", g_cps);
+    logf("[ac] running at %.1f CPS (slider 0-30). J or the Autoclicker button arms it. Click the X to unload.\n", g_cps);
 
     timeBeginPeriod(1);   // 1 ms scheduler resolution -> tight, low-jitter ticks (paired below)
     g_hookThread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
@@ -1336,8 +1507,6 @@ static void run() {
     bool prevPhys    = false;  // last tick's g_physDown, to spot a fresh press
 
     while (g_running) {
-        if (GetAsyncKeyState(VK_END) & 0x8000) { logf("[ac] END pressed -- unloading.\n"); break; }
-
         g_gameWindow = findGameWindow();
 
         // Hotkey rebinding: grab the next key pressed (Esc clears the bind; mouse/End can't bind).
@@ -1385,7 +1554,7 @@ static void run() {
             return std::chrono::duration<double, std::milli>(now - t).count();
         };
 
-        bool focused = gameFocused();
+        bool focused = gameForeground();   // only click while Minecraft itself is active, never our GUI
         bool screen  = (g_authenticated && g_enabled && focused && env && screenOpen(env));
         g_screenOpen = screen;   // tells the mouse hook whether to seize the left button this tick
         if (!screen && g_guiLeftSeized) {
@@ -1435,19 +1604,16 @@ static void run() {
             // *stopping* the pulses slides the hold straight into mining -- so combat and breaking
             // the ground flow into each other with no release/re-press.
             if (press) osLeftDown = true;   // the real press just put the button down
-            int eval = env ? evalTarget(env) : EVAL_ALLOW;
+            bool backTurnSlow = g_backTurn;
+            int eval = env ? evalTarget(env, backTurnSlow) : EVAL_ALLOW;
             bool onBlock = (eval == EVAL_BLOCK);
-            if (onBlock && g_blockGuard) {
-                // Guard ON: don't let the held button dig -- hold it UP to suppress mining.
-                if (osLeftDown) { leftEdge(false); osLeftDown = false; }
-                state = 2;
-            } else if (onBlock) {
-                // Guard OFF on a block: keep the button DOWN so the real hold digs continuously.
+            if (onBlock) {
+                // On a block: keep the button DOWN so the real hold digs continuously.
                 if (!osLeftDown) { leftEdge(true); osLeftDown = true; }
                 state = 8;
             } else {
                 // Entity / air: combat. Pulse the button (release->press = one attack) at the CPS.
-                if (eval == EVAL_BACKTURN && !g_backTurn) eval = EVAL_ALLOW;  // slow off -> full CPS
+                clearLeftClickDelay(env);
                 double gap = baseGap;
                 if (eval == EVAL_BACKTURN) {
                     double bt = 1000.0 / BACKTURN_CPS;   // back turned -> the slower of the two rates
@@ -1457,6 +1623,7 @@ static void run() {
                     leftEdge(false); leftEdge(true);   // one attack, ending DOWN (still held)
                     osLeftDown = true;
                     lastClick = now;
+                    clearLeftClickDelay(env);
                 }
                 state = (eval == EVAL_BACKTURN) ? 5 : (g_canDetectBlocks ? 1 : 3);
             }
@@ -1468,9 +1635,13 @@ static void run() {
             osLeftDown = false;                 // not holding -> drop any sustained world state
         }
 
-        // Right clicker: independent of the left logic, gated at the same CPS.
+        // Right clicker: independent of the left logic, gated at the same CPS. Only auto-clicks while
+        // a block or bucket is the held item (cached here for the mouse hook); in a GUI it instead
+        // honours Shift, matching the inventory right-click behaviour.
+        g_holdingPlaceable = (g_authenticated && g_enabled && g_rightClicker && focused && env)
+                             ? holdingPlaceable(env) : false;
         bool rightActive = false;
-        bool rightAllowed = !screen || physicalShiftHeld();
+        bool rightAllowed = screen ? physicalShiftHeld() : g_holdingPlaceable;
         if (g_authenticated && g_enabled && g_rightClicker && g_physRightDown && focused && rightAllowed && !off) {
             if (msSince(lastRight) >= baseGap) { sendRightClick(); lastRight = now; }
             rightActive = true;
@@ -1488,7 +1659,6 @@ static void run() {
             else if (rightActive)            setStatus("right-clicking \xc2\xb7 hold RMB");
             else if (state == 0) setStatus("armed \xc2\xb7 idle (hold LMB)");
             else if (state == 1) setStatus("clicking \xc2\xb7 entity / air");
-            else if (state == 2) setStatus("block guarded \xc2\xb7 won't mine");
             else if (state == 3) setStatus("clicking \xc2\xb7 no block-detect");
             else if (state == 4) setStatus("clicking \xc2\xb7 inventory L/R");
             else if (state == 5) setStatus("back turned \xc2\xb7 6 CPS");
@@ -1532,6 +1702,8 @@ static void run() {
         if (g_entityClass)       env->DeleteGlobalRef(g_entityClass);
         if (g_guiContainerClass) env->DeleteGlobalRef(g_guiContainerClass);
         if (g_itemPotionClass)   env->DeleteGlobalRef(g_itemPotionClass);
+        if (g_itemBlockClass)    env->DeleteGlobalRef(g_itemBlockClass);
+        if (g_itemBucketClass)   env->DeleteGlobalRef(g_itemBucketClass);
     }
     if (env && g_jvm) g_jvm->DetachCurrentThread();
 

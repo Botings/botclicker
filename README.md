@@ -3,17 +3,18 @@
 A minimal Windows DLL injector and a demo payload, targeting Minecraft Java (`javaw.exe`).
 
 - **`injector.cpp`** — classic `LoadLibrary` injector via `CreateRemoteThread`.
-- **`payload.cpp`** — a JVMTI/JNI agent: a left-click autoclicker that **never mines blocks**.
+- **`payload.cpp`** — a JVMTI/JNI agent: a left-click autoclicker for combat and mining.
 
 ## What the agent does
 
 While Minecraft is the foreground window, holding **left-click** fires clicks at **15.8 CPS**:
 
-- A low-level mouse hook **swallows your real left-click** and the agent synthesizes all
-  clicks itself — this is what lets it avoid mining a block you're holding LMB on.
+- A low-level mouse hook layers synthesized click-edges on top of your real held button:
+  in the world the hold passes through, and in a container GUI it seizes Shift+LMB to
+  inject clean clicks.
 - It reads `Minecraft.objectMouseOver.typeOfHit` over JVMTI/JNI:
-  - aimed at a **block** → injects nothing (block untouched),
-  - **air / entity** → clicks through (attack swings),
+  - aimed at a **block** → holds LMB down so it digs continuously,
+  - **air / entity** → pulses clicks (attack swings) at the set CPS,
   - a **GUI is open** (`currentScreen != null`, e.g. your inventory) → clicks through.
 - Field names are tried as MCP (dev) then SRG (prod), so the same DLL works in a Gradle
   `runClient` session and a shipped Forge client. If neither resolves it degrades to
