@@ -1,6 +1,6 @@
 # injectable
 
-A minimal Windows DLL injector and a demo payload, targeting Minecraft Java (`javaw.exe`).
+A minimal Windows DLL injector workspace targeting Minecraft Java (`javaw.exe`).
 
 - **`injector.cpp`** — classic `LoadLibrary` injector via `CreateRemoteThread`.
 - **`payload.cpp`** — a JVMTI/JNI agent: a left-click autoclicker for combat and mining.
@@ -34,13 +34,14 @@ Requires MinGW-w64 g++ (64-bit) and a JDK with JNI/JVMTI headers. Defaults to
 ## Run
 
 1. Launch Minecraft Java (1.8.9 Forge) and enter a world.
-2. `.\injector.exe`  (run the terminal as administrator if `OpenProcess` fails).
-3. A console shows agent state (idle / autoclicking / aimed-at-block).
-4. Press **END** to cleanly unload.
+2. BotClicker: `.\injector.exe`  (run the terminal as administrator if `OpenProcess` fails).
+3. The BotClicker overlay shows agent state (idle / autoclicking / aimed-at-block).
+4. Press **END** to cleanly unload BotClicker.
 
 ## Notes / assumptions
 
-- Built and verified to compile; **not yet runtime-tested against a live client**.
+- This workspace needs MinGW-w64 g++ available on PATH, in a common MSYS2 location,
+  or via `$env:CXX` before the DLLs can be rebuilt.
 - Field names target **1.8.9 `stable_22`** mappings. Other versions need their own MCP/SRG
   names added in `payload.cpp` (`findField` calls).
 - Arch must match the JVM (64-bit here). Anti-cheats that monitor `SetWindowsHookEx` /

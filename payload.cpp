@@ -40,8 +40,6 @@
 #include <thread>
 #include <mmsystem.h>   // timeBeginPeriod / timeEndPeriod (link -lwinmm)
 
-#include "auth_code.h"
-
 #pragma comment(lib, "gdiplus.lib")
 
 // ---- globals ---------------------------------------------------------------
@@ -121,7 +119,6 @@ static volatile bool g_enabled     = false;   // master arm; starts off
 static volatile bool g_rightClicker= false;   // also rapid right-click while holding RMB
 static volatile bool g_backTurn    = false;   // optional slow CPS on a back-turned target
 static volatile bool g_potMove     = true;    // always shift-click splash pots you hover in a GUI
-static volatile bool g_authenticated = false; // password gate passed for this injection
 
 // Master-toggle hotkey. Rebindable from the GUI: click the row, then press any key.
 static volatile int  g_hotkey      = 'J';
@@ -147,8 +144,6 @@ enum { EVAL_ALLOW = 0, EVAL_BLOCK = 1, EVAL_BACKTURN = 2 };
 static char g_status[96] = "starting...";
 static char g_diag[96]   = "";
 static HWND g_hwnd = nullptr;
-static wchar_t g_authBuf[16] = L"";
-static bool g_authBad = false;
 
 static void requestRepaint() { if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
 
@@ -224,7 +219,7 @@ static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
         auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
         bool injected = (m->flags & LLMHF_INJECTED) != 0;   // our own SendInput clicks
         // Only seize buttons while armed AND the game (not our overlay) is focused.
-        if (!injected && g_authenticated && g_enabled && g_gameWindow && GetForegroundWindow() == g_gameWindow) {
+        if (!injected && g_enabled && g_gameWindow && GetForegroundWindow() == g_gameWindow) {
             bool screen = g_screenOpen;
             bool shift = physicalShiftHeld();
 
@@ -736,7 +731,7 @@ static DWORD WINAPI potThread(LPVOID) {
 
     while (g_running) {
         // Only move pots while the user is actually left-clicking and physically holding Shift.
-        bool baseActive = g_authenticated && g_potMove && g_enabled && g_physDown && g_mcInstance && g_fCurrentScreen &&
+        bool baseActive = g_potMove && g_enabled && g_physDown && g_mcInstance && g_fCurrentScreen &&
                           g_gameWindow && GetForegroundWindow() == g_gameWindow;
         bool active = baseActive && physicalShiftHeld();
         bool block = false;   // hovering a splash pot this tick -> main loop must not normal-click it
@@ -889,61 +884,6 @@ static void commitCpsEdit() {
     g_cpsEdit = false; g_cpsBuf[0] = 0;
 }
 
-static void resetRuntimeState() {
-    g_enabled = false;
-    g_physDown = false;
-    g_physRightDown = false;
-    g_guiLeftSeized = false;
-    g_guiRightSeized = false;
-    g_screenOpen = false;
-}
-
-static void submitAuthCode() {
-    char code[16] = {};
-    for (int i = 0; i < 15 && g_authBuf[i]; ++i) {
-        code[i] = static_cast<char>(g_authBuf[i]);
-    }
-
-    if (auth::verifyCode(code)) {
-        g_authenticated = true;
-        g_authBad = false;
-        g_authBuf[0] = 0;
-        setStatus("unlocked \xc2\xb7 ready");
-        logf("[ac] password accepted\n");
-    } else {
-        g_authBad = true;
-        g_authBuf[0] = 0;
-        resetRuntimeState();
-        setStatus("locked \xc2\xb7 bad password");
-        logf("[ac] password rejected\n");
-    }
-    requestRepaint();
-}
-
-// Paste the auth code from the clipboard (Ctrl+V on the locked screen). Pulls up to 6 digit chars
-// out of whatever text is on the clipboard, ignoring spaces/other characters, and auto-submits once
-// 6 are in. Replaces the field rather than appending, so a copied code always lands exactly.
-static void pasteAuthFromClipboard(HWND hwnd) {
-    if (!OpenClipboard(hwnd)) return;
-    HANDLE h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const wchar_t* clip = static_cast<const wchar_t*>(GlobalLock(h));
-        if (clip) {
-            size_t n = 0;
-            for (const wchar_t* p = clip; *p && n < 6; ++p)
-                if (*p >= L'0' && *p <= L'9') g_authBuf[n++] = *p;
-            g_authBuf[n] = 0;
-            g_authBad = false;
-            GlobalUnlock(h);
-            CloseClipboard();
-            if (n == 6) submitAuthCode();   // full code pasted -> unlock straight away
-            else requestRepaint();
-            return;
-        }
-    }
-    CloseClipboard();
-}
-
 static Color C(BYTE r, BYTE g, BYTE b, BYTE a = 255) { return Color(a, r, g, b); }
 
 static void fillRound(Graphics& g, const Color& col, RectF r, float rad) {
@@ -1069,36 +1009,6 @@ static void paint(HWND hwnd, HDC hdc) {
         wchar_t wbuf[128];
         if (g_minimized) {
             // collapsed: only the title bar + buttons are shown; skip the body entirely.
-        } else if (!g_authenticated) {
-            RectF card(22.0f, 164.0f, (REAL)(WIN_W - 44), 210.0f);
-            fillRound(g, C(21, 29, 52), card, 13.0f);
-            strokeRound(g, g_authBad ? C(214, 82, 82) : C(40, 52, 86), 1.2f, card, 13.0f);
-
-            SolidBrush txt(C(228, 235, 250)), hint(C(118, 132, 168));
-            g.DrawString(L"Locked", -1, fLabel, RectF(card.X + 24, card.Y + 22, card.Width - 48, 22), &sfL, &txt);
-            g.DrawString(L"Password  \xb7  type or paste (Ctrl+V)", -1, fHint, RectF(card.X + 24, card.Y + 56, card.Width - 48, 16), &sfL, &hint);
-
-            RectF input(card.X + 24, card.Y + 78, card.Width - 48, 46);
-            fillRound(g, C(12, 18, 34), input, 9.0f);
-            strokeRound(g, g_authBad ? C(214, 82, 82) : C(70, 90, 140), 1.0f, input, 9.0f);
-
-            wchar_t masked[16] = L"";
-            size_t n = wcslen(g_authBuf);
-            for (size_t i = 0; i < n && i < 6; ++i) masked[i] = L'*';
-            if (n < 6) { masked[n] = L'_'; masked[n + 1] = 0; }
-            SolidBrush inputTxt(C(234, 240, 252));
-            g.DrawString(masked, -1, fTitle, input, &sfC, &inputTxt);
-
-            char remText[32] = {};
-            auth::formatDuration(auth::secondsRemaining(), remText, sizeof(remText));
-            wchar_t rem[64];
-            wchar_t remWide[32];
-            MultiByteToWideChar(CP_UTF8, 0, remText, -1, remWide, 32);
-            swprintf_s(rem, L"code changes in %s", remWide);
-            SolidBrush msg(g_authBad ? C(235, 118, 118) : C(120, 135, 170));
-            g.DrawString(g_authBad ? L"invalid password" : L"run password.exe for the current code",
-                         -1, fHint, RectF(card.X + 24, card.Y + 140, card.Width - 48, 16), &sfL, &msg);
-            g.DrawString(rem, -1, fHint, RectF(card.X + 24, card.Y + 162, card.Width - 48, 16), &sfL, &hint);
         } else {
         // ---- toggle buttons ----
         for (int i = 0; i < N_TOGGLES; i++) {
@@ -1263,7 +1173,6 @@ static void applyMinimizedState(HWND hwnd) {
 static void toggleAt(int x, int y) {
     if (inRect(g_closeRc, x, y)) { PostMessageW(g_hwnd, WM_CLOSE, 0, 0); return; }
     if (inRect(g_minRc, x, y)) { g_minimized = !g_minimized; applyMinimizedState(g_hwnd); return; }
-    if (!g_authenticated) return;
     for (int i = 0; i < N_TOGGLES; i++) {
         if (inRect(g_togRc[i], x, y)) {
             volatile bool* s = g_toggles[i].state;
@@ -1329,7 +1238,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        if (!g_authenticated) return 0;
         if (inRect(g_sliderRc, x, y)) {         // right-click the slider -> type a CPS value
             if (g_cpsEdit) commitCpsEdit();     // second right-click commits
             else { g_cpsEdit = true; g_cpsBuf[0] = 0; g_dragSlider = false; SetFocus(hwnd); }
@@ -1340,30 +1248,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CHAR: {
-        if (!g_authenticated) {
-            wchar_t ch = (wchar_t)wp;
-            size_t n = wcslen(g_authBuf);
-            if (ch == 13) {
-                submitAuthCode();
-            } else if (ch == 22) {              // Ctrl+V -> paste the code from the clipboard
-                pasteAuthFromClipboard(hwnd);
-            } else if (ch == 27) {
-                g_authBuf[0] = 0;
-                g_authBad = false;
-                requestRepaint();
-            } else if (ch == 8) {
-                if (n) g_authBuf[n - 1] = 0;
-                g_authBad = false;
-                requestRepaint();
-            } else if (ch >= L'0' && ch <= L'9' && n < 6) {
-                g_authBuf[n] = ch;
-                g_authBuf[n + 1] = 0;
-                g_authBad = false;
-                if (n + 1 == 6) submitAuthCode();
-                else requestRepaint();
-            }
-            return 0;
-        }
         if (!g_cpsEdit) return 0;
         wchar_t ch = (wchar_t)wp;
         size_t n = wcslen(g_cpsBuf);
@@ -1380,15 +1264,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        if (!g_authenticated) {
-            if (inRect(g_closeRc, x, y) || inRect(g_minRc, x, y)) { toggleAt(x, y); return 0; }
-            SetFocus(hwnd);
-            if (y < 104) {
-                ReleaseCapture();
-                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-            }
-            return 0;
-        }
         if (g_cpsEdit) commitCpsEdit();         // any left-click ends CPS typing
         if (inRect(g_sliderRc, x, y)) {         // grab the click-speed slider
             g_dragSlider = true;
@@ -1532,7 +1407,7 @@ static void run() {
 
         // Hotkey toggle: edge-detected, only when focused and not typing in a screen/chat.
         bool keyDown = g_hotkey != 0 && (GetAsyncKeyState(g_hotkey) & 0x8000) != 0;
-        if (g_authenticated && !g_rebinding && keyDown && !lastKey && gameFocused() && !(env && screenOpen(env))) {
+        if (!g_rebinding && keyDown && !lastKey && gameFocused() && !(env && screenOpen(env))) {
             g_enabled = !g_enabled;
             if (!g_enabled) {
                 g_physDown = false; g_physRightDown = false;  // drop held state
@@ -1555,7 +1430,7 @@ static void run() {
         };
 
         bool focused = gameForeground();   // only click while Minecraft itself is active, never our GUI
-        bool screen  = (g_authenticated && g_enabled && focused && env && screenOpen(env));
+        bool screen  = (g_enabled && focused && env && screenOpen(env));
         g_screenOpen = screen;   // tells the mouse hook whether to seize the left button this tick
         if (!screen && g_guiLeftSeized) {
             g_physDown = false;
@@ -1566,7 +1441,7 @@ static void run() {
             g_guiRightSeized = false;
         }
 
-        bool holding = g_authenticated && g_enabled && g_physDown && focused && !off;
+        bool holding = g_enabled && g_physDown && focused && !off;
         bool press   = holding && !prevPhys;   // fresh left press this tick
         prevPhys     = holding;
 
@@ -1638,11 +1513,11 @@ static void run() {
         // Right clicker: independent of the left logic, gated at the same CPS. Only auto-clicks while
         // a block or bucket is the held item (cached here for the mouse hook); in a GUI it instead
         // honours Shift, matching the inventory right-click behaviour.
-        g_holdingPlaceable = (g_authenticated && g_enabled && g_rightClicker && focused && env)
+        g_holdingPlaceable = (g_enabled && g_rightClicker && focused && env)
                              ? holdingPlaceable(env) : false;
         bool rightActive = false;
         bool rightAllowed = screen ? physicalShiftHeld() : g_holdingPlaceable;
-        if (g_authenticated && g_enabled && g_rightClicker && g_physRightDown && focused && rightAllowed && !off) {
+        if (g_enabled && g_rightClicker && g_physRightDown && focused && rightAllowed && !off) {
             if (msSince(lastRight) >= baseGap) { sendRightClick(); lastRight = now; }
             rightActive = true;
         } else if (!focused) {
