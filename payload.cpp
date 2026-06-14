@@ -975,17 +975,17 @@ static void run() {
 
     timeBeginPeriod(1);
     g_hookThread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
     using clock = std::chrono::steady_clock;
-    auto start     = clock::now();
-    auto lastClick = start - std::chrono::hours(1);
-    auto lastRight = lastClick;
-    auto lastWindowRefresh = lastClick;
-    auto lastScreenPoll    = lastClick;
-    auto lastTargetPoll    = lastClick;
-    auto lastHeldPoll      = lastClick;
-    auto lastDelayClear    = lastClick;
+    auto start = clock::now();
+    auto stale = start - std::chrono::hours(1);
+    auto nextLeftClick = start;
+    auto nextRightClick = start;
+    auto lastWindowRefresh = stale;
+    auto lastScreenPoll    = stale;
+    auto lastTargetPoll    = stale;
+    auto lastHeldPoll      = stale;
+    auto lastDelayClear    = stale;
 
     int  lastState = -99;
     bool lastKey = false;
@@ -1059,6 +1059,14 @@ static void run() {
         double cps = g_cps;
         bool   off = (cps < CPS_OFF_EPS);
         double baseGap = off ? 1e9 : (1000.0 / cps);
+        auto clickGap = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double, std::milli>(baseGap));
+        auto inventoryGap = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double, std::milli>(baseGap * 0.5));
+        auto scheduleNext = [&](clock::time_point& deadline, clock::duration gap) {
+            deadline += gap;
+            if (deadline <= now) deadline = now + gap;
+        };
 
         bool screen  = (g_enabled && focused && cachedScreenOpen);
         g_screenOpen = screen;
@@ -1080,9 +1088,9 @@ static void run() {
         int state = 0;
         if (alwaysLeft) {
             osLeftDown = false;
-            if (msSince(lastClick) >= baseGap) {
+            if (now >= nextLeftClick) {
                 sendClick();
-                lastClick = now;
+                scheduleNext(nextLeftClick, clickGap);
             }
             state = 9;
         } else if (holding && screen) {
@@ -1094,10 +1102,10 @@ static void run() {
                 state = 7;
             }
 
-            else if (msSince(lastClick) >= baseGap * 0.5) {
+            else if (now >= nextLeftClick) {
                 if (invLeftNext) sendClick(); else sendRightClick();
                 invLeftNext = !invLeftNext;
-                lastClick = now;
+                scheduleNext(nextLeftClick, inventoryGap);
                 state = 4;
             } else {
                 state = 4;
@@ -1121,11 +1129,11 @@ static void run() {
                     clearLeftClickDelay(env);
                     lastDelayClear = now;
                 }
-                if (msSince(lastClick) >= baseGap) {
+                if (now >= nextLeftClick) {
                     clearLeftClickDelay(env);
                     pulseHeldLeftClick();
                     osLeftDown = true;
-                    lastClick = now;
+                    scheduleNext(nextLeftClick, clickGap);
                     clearLeftClickDelay(env);
                     lastDelayClear = now;
                 }
@@ -1139,6 +1147,7 @@ static void run() {
             osLeftDown = false;
             cachedTargetEval = EVAL_ALLOW;
             lastTargetPoll = now;
+            nextLeftClick = now;
         }
 
         if (g_enabled && g_rightClicker && focused && env) {
@@ -1154,11 +1163,17 @@ static void run() {
         bool rightActive = false;
         bool rightAllowed = screen ? physicalShiftHeld() : g_holdingPlaceable;
         if (g_enabled && g_rightClicker && g_physRightDown && focused && rightAllowed && !off) {
-            if (msSince(lastRight) >= baseGap) { sendRightClick(); lastRight = now; }
+            if (now >= nextRightClick) {
+                sendRightClick();
+                scheduleNext(nextRightClick, clickGap);
+            }
             rightActive = true;
         } else if (!focused) {
             g_physRightDown = false;
             g_guiRightSeized = false;
+            nextRightClick = now;
+        } else {
+            nextRightClick = now;
         }
 
         int combo = state * 2 + (rightActive ? 1 : 0);
