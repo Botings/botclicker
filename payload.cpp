@@ -66,6 +66,7 @@ static volatile double g_cps     = 15.8;
 static const double  CPS_MIN     = 0.0;
 static const double  CPS_MAX     = 30.0;
 static const double  CPS_OFF_EPS = 0.1;
+static const ULONG_PTR INPUT_TAG = 0x42434C4B;
 
 enum { EVAL_ALLOW = 0, EVAL_BLOCK = 1 };
 
@@ -194,24 +195,38 @@ static DWORD WINAPI hookThread(LPVOID) {
     return 0;
 }
 
+static INPUT mouseButtonInput(DWORD flags) {
+    INPUT in = {};
+    in.type = INPUT_MOUSE;
+    in.mi.dwFlags = flags;
+    in.mi.dwExtraInfo = INPUT_TAG;
+    return in;
+}
+
 static void sendClick() {
     INPUT in[2] = {};
-    in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    in[0] = mouseButtonInput(MOUSEEVENTF_LEFTDOWN);
+    in[1] = mouseButtonInput(MOUSEEVENTF_LEFTUP);
     SendInput(2, in, sizeof(INPUT));
 }
 
 static void sendRightClick() {
     INPUT in[2] = {};
-    in[0].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-    in[1].type = INPUT_MOUSE; in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    in[0] = mouseButtonInput(MOUSEEVENTF_RIGHTDOWN);
+    in[1] = mouseButtonInput(MOUSEEVENTF_RIGHTUP);
     SendInput(2, in, sizeof(INPUT));
 }
 
 static void leftEdge(bool down) {
-    INPUT in = {}; in.type = INPUT_MOUSE;
-    in.mi.dwFlags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+    INPUT in = mouseButtonInput(down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
     SendInput(1, &in, sizeof(INPUT));
+}
+
+static void pulseHeldLeftClick() {
+    INPUT in[2] = {};
+    in[0] = mouseButtonInput(MOUSEEVENTF_LEFTUP);
+    in[1] = mouseButtonInput(MOUSEEVENTF_LEFTDOWN);
+    SendInput(2, in, sizeof(INPUT));
 }
 
 static jclass findLoadedClass(JNIEnv* env, const char* sig) {
@@ -960,20 +975,53 @@ static void run() {
 
     timeBeginPeriod(1);
     g_hookThread = CreateThread(nullptr, 0, hookThread, nullptr, 0, nullptr);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
-    using clock = std::chrono::high_resolution_clock;
-    auto nextTick  = clock::now();
-    auto lastClick = clock::now() - std::chrono::hours(1);
+    using clock = std::chrono::steady_clock;
+    auto start     = clock::now();
+    auto lastClick = start - std::chrono::hours(1);
     auto lastRight = lastClick;
+    auto lastWindowRefresh = lastClick;
+    auto lastScreenPoll    = lastClick;
+    auto lastTargetPoll    = lastClick;
+    auto lastHeldPoll      = lastClick;
+    auto lastDelayClear    = lastClick;
 
     int  lastState = -99;
     bool lastKey = false;
     bool invLeftNext = true;
     bool osLeftDown  = false;
     bool prevPhys    = false;
+    bool cachedScreenOpen = false;
+    int  cachedTargetEval = EVAL_ALLOW;
+    bool cachedPlaceable  = false;
 
     while (g_running) {
-        g_gameWindow = findGameWindow();
+        auto now = clock::now();
+        auto msSince = [&](const clock::time_point& t) {
+            return std::chrono::duration<double, std::milli>(now - t).count();
+        };
+
+        HWND game = g_gameWindow;
+        bool refreshWindow = msSince(lastWindowRefresh) >= 250.0;
+        bool staleWindow = game && !IsWindow(game);
+        if (refreshWindow || staleWindow) {
+            g_gameWindow = findGameWindow();
+            lastWindowRefresh = now;
+        }
+
+        bool focusedAny = gameFocused();
+        bool focused    = gameForeground();
+
+        if (env && focusedAny) {
+            if (msSince(lastScreenPoll) >= 20.0) {
+                cachedScreenOpen = screenOpen(env);
+                lastScreenPoll = now;
+            }
+        } else {
+            cachedScreenOpen = false;
+            lastScreenPoll = now;
+        }
 
         if (g_rebinding) {
             if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
@@ -996,7 +1044,7 @@ static void run() {
         }
 
         bool keyDown = g_hotkey != 0 && (GetAsyncKeyState(g_hotkey) & 0x8000) != 0;
-        if (!g_rebinding && keyDown && !lastKey && gameFocused() && !(env && screenOpen(env))) {
+        if (!g_rebinding && keyDown && !lastKey && focusedAny && !cachedScreenOpen) {
             g_enabled = !g_enabled;
             if (!g_enabled) {
                 g_physDown = false; g_physRightDown = false;
@@ -1011,13 +1059,8 @@ static void run() {
         double cps = g_cps;
         bool   off = (cps < CPS_OFF_EPS);
         double baseGap = off ? 1e9 : (1000.0 / cps);
-        auto   now     = clock::now();
-        auto   msSince = [&](const clock::time_point& t) {
-            return std::chrono::duration<double, std::milli>(now - t).count();
-        };
 
-        bool focused = gameForeground();
-        bool screen  = (g_enabled && focused && env && screenOpen(env));
+        bool screen  = (g_enabled && focused && cachedScreenOpen);
         g_screenOpen = screen;
         if (!screen && g_guiLeftSeized) {
             g_physDown = false;
@@ -1062,7 +1105,11 @@ static void run() {
         } else if (holding) {
 
             if (press) osLeftDown = true;
-            int eval = env ? evalTarget(env) : EVAL_ALLOW;
+            if (press || msSince(lastTargetPoll) >= 5.0) {
+                cachedTargetEval = env ? evalTarget(env) : EVAL_ALLOW;
+                lastTargetPoll = now;
+            }
+            int eval = cachedTargetEval;
             bool onBlock = (eval == EVAL_BLOCK);
             if (onBlock) {
 
@@ -1070,12 +1117,17 @@ static void run() {
                 state = 8;
             } else {
 
-                clearLeftClickDelay(env);
+                if (msSince(lastDelayClear) >= 15.0) {
+                    clearLeftClickDelay(env);
+                    lastDelayClear = now;
+                }
                 if (msSince(lastClick) >= baseGap) {
-                    leftEdge(false); leftEdge(true);
+                    clearLeftClickDelay(env);
+                    pulseHeldLeftClick();
                     osLeftDown = true;
                     lastClick = now;
                     clearLeftClickDelay(env);
+                    lastDelayClear = now;
                 }
                 state = g_canDetectBlocks ? 1 : 3;
             }
@@ -1085,10 +1137,20 @@ static void run() {
                 g_guiLeftSeized = false;
             }
             osLeftDown = false;
+            cachedTargetEval = EVAL_ALLOW;
+            lastTargetPoll = now;
         }
 
-        g_holdingPlaceable = (g_enabled && g_rightClicker && focused && env)
-                             ? holdingPlaceable(env) : false;
+        if (g_enabled && g_rightClicker && focused && env) {
+            if (msSince(lastHeldPoll) >= 50.0) {
+                cachedPlaceable = holdingPlaceable(env);
+                lastHeldPoll = now;
+            }
+        } else {
+            cachedPlaceable = false;
+            lastHeldPoll = now;
+        }
+        g_holdingPlaceable = cachedPlaceable;
         bool rightActive = false;
         bool rightAllowed = screen ? physicalShiftHeld() : g_holdingPlaceable;
         if (g_enabled && g_rightClicker && g_physRightDown && focused && rightAllowed && !off) {
@@ -1115,10 +1177,7 @@ static void run() {
             lastState = combo;
         }
 
-        nextTick += std::chrono::milliseconds(1);
-        auto tnow = clock::now();
-        if (nextTick < tnow) nextTick = tnow;
-        std::this_thread::sleep_until(nextTick);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     timeEndPeriod(1);
