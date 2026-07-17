@@ -43,6 +43,7 @@ static jclass        g_itemBucketClass = nullptr;
 static bool          g_canDetectHeld   = false;
 
 static volatile HWND g_gameWindow = nullptr;
+static volatile bool g_gameFg        = false;   // cached: game window is foreground (kept fresh by worker loop)
 static volatile bool g_physDown      = false;
 static volatile bool g_physRightDown = false;
 
@@ -137,11 +138,24 @@ static inline bool physicalShiftHeld() {
 }
 
 static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
-    if (code == HC_ACTION) {
+    // A WH_MOUSE_LL hook sits in the OS mouse pipeline: every extra microsecond
+    // spent here delays ALL mouse movement system-wide, and if we exceed
+    // LowLevelHooksTimeout Windows batches input into bursts that the game reads
+    // as sudden acceleration. So: bail on anything that isn't a button event
+    // BEFORE touching any syscall, and use a cached foreground flag instead of
+    // calling GetForegroundWindow() per-event.
+    if (code != HC_ACTION)
+        return CallNextHookEx(nullptr, code, w, l);
+
+    if (w != WM_LBUTTONDOWN && w != WM_LBUTTONUP &&
+        w != WM_RBUTTONDOWN && w != WM_RBUTTONUP)
+        return CallNextHookEx(nullptr, code, w, l);
+
+    {
         auto* m = reinterpret_cast<MSLLHOOKSTRUCT*>(l);
         bool injected = (m->flags & LLMHF_INJECTED) != 0;
 
-        if (!injected && g_enabled && g_gameWindow && GetForegroundWindow() == g_gameWindow) {
+        if (!injected && g_enabled && g_gameFg) {
             bool screen = g_screenOpen;
             bool shift = physicalShiftHeld();
 
@@ -185,6 +199,11 @@ static LRESULT CALLBACK mouseProc(int code, WPARAM w, LPARAM l) {
 }
 static DWORD WINAPI hookThread(LPVOID) {
     g_hookThreadId = GetCurrentThreadId();
+
+    // The LL hook must be serviced promptly or Windows delays/batches mouse
+    // input (felt as acceleration in-game). Keep this thread above the busy
+    // worker loop so it is never starved.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, mouseProc, g_self, 0);
     if (!g_mouseHook) { logf("[ac] WARNING: mouse hook failed (%lu)\n", GetLastError()); return 1; }
@@ -1012,6 +1031,7 @@ static void run() {
 
         bool focusedAny = gameFocused();
         bool focused    = gameForeground();
+        g_gameFg = focused;   // read by the LL mouse hook instead of GetForegroundWindow()
 
         if (env && focusedAny) {
             if (msSince(lastScreenPoll) >= 20.0) {
